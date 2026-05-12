@@ -1,0 +1,10 @@
+name = "bookclub-api"
+main = "src/index.js"
+compatibility_date = "2025-01-01"
+
+# KV namespace — this is where all app data lives.
+# The `binding` name "DATA" is what the Worker code uses: env.DATA.get(...)
+# Fill in `id` after running: wrangler kv namespace create DATA
+[[kv_namespaces]]
+binding = "DATA"
+id = "89c525a8a06d4206a7c0b1d575c361c3"

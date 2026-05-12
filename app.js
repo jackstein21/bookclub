@@ -1,0 +1,1384 @@
+// ============================================================
+// BOOKCLUB
+// ============================================================
+
+// ============================================================
+// STORAGE
+// ============================================================
+const DB = {
+  _get: (k) => { try { return JSON.parse(localStorage.getItem('bc_' + k)); } catch { return null; } },
+  _set: (k, v) => localStorage.setItem('bc_' + k, JSON.stringify(v)),
+
+  getUser:    ()  => DB._get('user'),
+  setUser:    (u) => DB._set('user', u),
+
+  getBooks:   ()  => DB._get('books') || [],
+  saveBook:   (b) => {
+    const arr = DB.getBooks();
+    const i = arr.findIndex(x => x.id === b.id);
+    i >= 0 ? arr[i] = b : arr.push(b);
+    DB._set('books', arr);
+    Sync.push();
+  },
+  deleteBook: (id) => { DB._set('books', DB.getBooks().filter(b => b.id !== id)); Sync.push(); },
+  getActiveBook: () => {
+    const books = DB.getBooks();
+    return books.find(b => b.isActive) || books[0] || null;
+  },
+  setActiveBook: (id) => {
+    DB._set('books', DB.getBooks().map(b => ({ ...b, isActive: b.id === id })));
+    Sync.push();
+  },
+
+  getDeadlines: () => (DB._get('deadlines') || []).sort((a, b) => new Date(a.date) - new Date(b.date)),
+  saveDeadline: (d) => {
+    const arr = DB._get('deadlines') || [];
+    const i = arr.findIndex(x => x.id === d.id);
+    i >= 0 ? arr[i] = d : arr.push(d);
+    DB._set('deadlines', arr);
+    Sync.push();
+  },
+  deleteDeadline: (id) => { DB._set('deadlines', (DB._get('deadlines') || []).filter(d => d.id !== id)); Sync.push(); },
+
+  getProgress: ()  => DB._get('progress') || { jack: null, jordan: null },
+  updateProgress: (user, page) => {
+    const p = DB.getProgress();
+    if (!p[user]) p[user] = { history: [] };
+    p[user].currentPage = page;
+    p[user].updatedAt   = new Date().toISOString();
+    if (!p[user].history) p[user].history = [];
+    p[user].history.push({ page, date: new Date().toISOString() });
+    DB._set('progress', p);
+    Sync.push();
+  },
+
+  getQuestions: ()     => DB._get('questions') || [],
+  getQuestion:  (wid)  => (DB._get('questions') || []).find(q => q.weekId === wid) || null,
+  saveQuestion: (q) => {
+    const arr = DB._get('questions') || [];
+    const i = arr.findIndex(x => x.weekId === q.weekId);
+    i >= 0 ? arr[i] = q : arr.push(q);
+    DB._set('questions', arr);
+    Sync.push();
+  },
+
+  getNotes:   ()  => (DB._get('notes') || []).sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt)),
+  saveNote:   (n) => {
+    const arr = DB._get('notes') || [];
+    arr.push(n);
+    DB._set('notes', arr);
+    Sync.push();
+  },
+  deleteNote: (id) => {
+    DB._set('notes', (DB._get('notes') || []).filter(n => n.id !== id));
+    Sync.push();
+  },
+};
+
+// ============================================================
+// SYNC — Cloudflare Workers backend
+//
+// How it fits together:
+//   DB.*  → always reads/writes localStorage immediately (instant, works offline)
+//   Sync.push() → after every write, sends the full state to the Worker async
+//   Sync.pull() → on page load, fetches remote state and overwrites localStorage
+//
+// This means: open the app on your phone → pull latest → make changes → push.
+// Open on laptop → pull → see phone's changes. The remote is the single source
+// of truth; localStorage is just a fast local cache.
+//
+// SETUP (run once after deploying the Worker):
+//   1. Copy config.example.js → config.js (gitignored)
+//   2. Fill in BOOKCLUB_API_URL and BOOKCLUB_APP_KEY in config.js
+// ============================================================
+const API_URL = window.BOOKCLUB_API_URL || '';
+const APP_KEY = window.BOOKCLUB_APP_KEY || '';
+
+const Sync = {
+  // Pull remote state into localStorage. Called once on page load.
+  // Remote always wins — this is how Jordan's changes appear on Jack's device.
+  async pull() {
+    if (!this._configured()) return;
+    try {
+      const res = await fetch(`${API_URL}/api/data`, {
+        headers: { 'X-App-Key': APP_KEY },
+      });
+      if (res.status === 429) { this._limitBanner(await res.json()); return; }
+      if (!res.ok) return;
+      const data = await res.json();
+      // Only overwrite keys that exist in the remote payload
+      ['books', 'deadlines', 'progress', 'questions', 'notes'].forEach(k => {
+        if (data[k] !== undefined) DB._set(k, data[k]);
+      });
+    } catch {
+      // Network unavailable — silently fall back to cached localStorage data
+    }
+  },
+
+  // Push the full local state to remote. Fire-and-forget after every DB write.
+  // Using one blob keeps KV writes minimal (1 write per save, not one per record).
+  async push() {
+    if (!this._configured()) return;
+    try {
+      const res = await fetch(`${API_URL}/api/data`, {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/json', 'X-App-Key': APP_KEY },
+        body:    JSON.stringify({
+          books:     DB._get('books')     || [],
+          deadlines: DB._get('deadlines') || [],
+          progress:  DB._get('progress')  || {},
+          questions: DB._get('questions') || [],
+          notes:     DB._get('notes')     || [],
+        }),
+      });
+      if (res.status === 429) { this._limitBanner(await res.json()); }
+    } catch {
+      // Silently fail — data is safe in localStorage, will sync next time
+    }
+  },
+
+  _configured() {
+    return API_URL !== 'REPLACE_WITH_WORKER_URL' && APP_KEY !== 'REPLACE_WITH_APP_KEY';
+  },
+
+  // Show a dismissible banner when the 90k daily limit is hit.
+  // The app still works read-only via localStorage until midnight UTC resets the counter.
+  _limitBanner(data) {
+    if (document.getElementById('rate-limit-banner')) return;
+    const el = document.createElement('div');
+    el.id = 'rate-limit-banner';
+    el.className = 'rate-limit-banner';
+    el.innerHTML = `
+      <span>⚠️ Daily sync limit reached (${(data.limit || 90000).toLocaleString()} requests/day).
+      The app is read-only until midnight UTC — your local data is safe.</span>
+      <button onclick="this.parentElement.remove()">Dismiss</button>
+    `;
+    document.body.prepend(el);
+  },
+};
+
+// ============================================================
+// UTILS
+// ============================================================
+const uid = () => Math.random().toString(36).slice(2, 10);
+
+function cap(s) { return s ? s.charAt(0).toUpperCase() + s.slice(1) : ''; }
+function other(user) { return user === 'jack' ? 'jordan' : 'jack'; }
+
+function fmtDate(str) {
+  if (!str) return '';
+  return new Date(str + 'T12:00:00').toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+}
+
+function daysUntil(str) {
+  if (!str) return null;
+  const today  = new Date(); today.setHours(0,0,0,0);
+  const target = new Date(str + 'T00:00:00');
+  return Math.ceil((target - today) / 86400000);
+}
+
+function isPast(str) { return daysUntil(str) < 0; }
+function isUpcoming(str) { return daysUntil(str) > 0; }
+
+function timeOfDay() {
+  const h = new Date().getHours();
+  return h < 12 ? 'morning' : h < 17 ? 'afternoon' : 'evening';
+}
+
+// Weeks are derived from sorted deadlines for a book
+function getWeeks(bookId) {
+  return DB.getDeadlines()
+    .filter(d => d.bookId === bookId)
+    .map((d, i) => ({ weekId: d.id, weekNum: i + 1, label: `Week ${i + 1}`, deadline: d }));
+}
+
+function blankQuestion(weekId, bookId) {
+  return {
+    weekId, bookId,
+    jackWroteForJordan: null,
+    jordanWroteForJack: null,
+    answers: {
+      jack:   { resonated: null, disagreed: null, custom: null, submittedAt: null },
+      jordan: { resonated: null, disagreed: null, custom: null, submittedAt: null },
+    },
+  };
+}
+
+function daysChip(days) {
+  if (days === null)  return '';
+  if (days < 0)       return `<span class="chip chip-red">Overdue ${Math.abs(days)}d</span>`;
+  if (days === 0)     return `<span class="chip chip-amber">Due today</span>`;
+  if (days <= 3)      return `<span class="chip chip-amber">${days}d left</span>`;
+  return `<span class="chip chip-green">${days}d left</span>`;
+}
+
+// ============================================================
+// ROUTER
+// ============================================================
+function getHash() { return window.location.hash.slice(1) || '/'; }
+function navigate(path) { window.location.hash = path; }
+
+function handleRoute() {
+  const user = DB.getUser();
+  if (!user) { renderFull(pageUserSelect()); return; }
+
+  const hash  = getHash();
+  const parts = hash.split('/').filter(Boolean);
+
+  let content;
+  if      (hash === '/' || hash === '')           content = pageDashboard();
+  else if (hash === '/books')                     content = pageBooks();
+  else if (hash === '/books/add')                 content = pageBookForm(null);
+  else if (hash.startsWith('/books/edit/'))       content = pageBookForm(DB.getBooks().find(b => b.id === parts[2]));
+  else if (hash === '/deadlines')                 content = pageDeadlines();
+  else if (hash === '/deadlines/add')             content = pageAddDeadline();
+  else if (hash === '/progress')                  content = pageProgress();
+  else if (hash === '/questions')                 content = pageQuestions();
+  else if (hash.startsWith('/questions/week/'))   content = pageWeekQuestions(parts[2]);
+  else if (hash === '/notes')                     content = pageNotes();
+  else                                            content = pageDashboard();
+
+  renderWithShell(content);
+}
+
+window.addEventListener('hashchange', handleRoute);
+
+// ============================================================
+// RENDER
+// ============================================================
+function renderFull(html) {
+  document.getElementById('app').innerHTML = html;
+}
+
+function renderWithShell(content) {
+  const user  = DB.getUser();
+  const hash  = getHash();
+
+  // Desktop sidebar shows all pages. Mobile bottom nav shows the 5 most-used
+  // (Books is accessed via Dashboard → Manage Books on mobile).
+  const allNavItems = [
+    { href: '/',          icon: icons.grid,     label: 'Home',      mobile: true,  match: () => hash === '/' || hash === '' },
+    { href: '/books',     icon: icons.book,     label: 'Books',     mobile: false, match: () => hash.startsWith('/books') },
+    { href: '/deadlines', icon: icons.calendar, label: 'Deadlines', mobile: true,  match: () => hash.startsWith('/deadlines') },
+    { href: '/progress',  icon: icons.chart,    label: 'Progress',  mobile: true,  match: () => hash === '/progress' },
+    { href: '/notes',     icon: icons.notes,    label: 'Notes',     mobile: true,  match: () => hash === '/notes' },
+    { href: '/questions', icon: icons.chat,     label: 'Questions', mobile: true,  match: () => hash.startsWith('/questions') },
+  ];
+
+  const navLinks       = allNavItems.map(n => `
+    <a href="#${n.href}" class="nav-link ${n.match() ? 'active' : ''}">
+      ${n.icon}<span>${n.label}</span>
+    </a>`).join('');
+  const mobileNavLinks = allNavItems.filter(n => n.mobile).map(n => `
+    <a href="#${n.href}" class="nav-link ${n.match() ? 'active' : ''}">
+      ${n.icon}<span>${n.label}</span>
+    </a>`).join('');
+
+  document.getElementById('app').innerHTML = `
+    <div class="layout">
+
+      <!-- Mobile-only top bar -->
+      <header class="mobile-header">
+        <div class="mobile-header-logo">${icons.mountain}<span>BookClub</span></div>
+        <button class="mobile-user-btn" onclick="switchUser()" title="Switch user">
+          <div class="user-avatar">${cap(user).charAt(0)}</div>
+        </button>
+      </header>
+
+      <!-- Desktop sidebar -->
+      <nav class="sidebar">
+        <div class="sidebar-header">
+          <div class="logo">${icons.mountain}<span>BookClub</span></div>
+        </div>
+        <div class="nav-links">${navLinks}</div>
+        <div class="sidebar-footer">
+          <div class="user-pill">
+            <div class="user-avatar">${cap(user).charAt(0)}</div>
+            <span>${cap(user)}</span>
+            <button class="switch-user-btn" onclick="switchUser()">Switch</button>
+          </div>
+        </div>
+      </nav>
+
+      <main class="main-content">${content}</main>
+
+      <!-- Mobile-only bottom nav (Books excluded — access via Dashboard) -->
+      <nav class="bottom-nav">${mobileNavLinks}</nav>
+
+    </div>
+  `;
+}
+
+// ============================================================
+// ICONS (inline SVG)
+// ============================================================
+const icons = {
+  mountain: `<svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><polygon points="3 20 9 4 15 13 18 9 21 20"/><line x1="3" y1="20" x2="21" y2="20"/></svg>`,
+  grid:     `<svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/></svg>`,
+  book:     `<svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/></svg>`,
+  calendar: `<svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><rect x="3" y="4" width="18" height="18" rx="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/></svg>`,
+  chart:    `<svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>`,
+  chat:     `<svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>`,
+  chevron:  `<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="9 18 15 12 9 6"/></svg>`,
+  notes:    `<svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>`,
+};
+
+// ============================================================
+// PAGE: USER SELECT
+// ============================================================
+function pageUserSelect() {
+  return `
+    <div class="user-select-page">
+      <div class="user-select-inner">
+        <div class="user-select-logo">${icons.mountain}</div>
+        <h1>BookClub</h1>
+        <p class="user-select-subtitle">Jack & Jordan · Breckenridge, CO</p>
+        <p class="user-select-who">Who's reading?</p>
+        <div class="user-cards">
+          <button class="user-card" onclick="selectUser('jack')">
+            <div class="user-card-avatar jack">J</div>
+            <div class="user-card-name">Jack</div>
+          </button>
+          <button class="user-card" onclick="selectUser('jordan')">
+            <div class="user-card-avatar jordan">J</div>
+            <div class="user-card-name">Jordan</div>
+          </button>
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+function selectUser(user) { DB.setUser(user); navigate('/'); }
+function switchUser()      { DB.setUser(null); renderFull(pageUserSelect()); }
+
+// ============================================================
+// PAGE: DASHBOARD
+// ============================================================
+function pageDashboard() {
+  const user    = DB.getUser();
+  const book    = DB.getActiveBook();
+  const prog    = DB.getProgress();
+  const myProg  = prog[user];
+
+  if (!book) return `
+    <div class="page">
+      <div class="page-header"><div><h1 class="page-title">Dashboard</h1><p class="page-subtitle">Good ${timeOfDay()}, ${cap(user)}</p></div></div>
+      <div class="empty-state">
+        <div class="empty-icon">📚</div>
+        <h3>No book yet</h3>
+        <p>Add your first book to get started.</p>
+        <a href="#/books/add" class="btn btn-primary">Add a Book</a>
+      </div>
+    </div>`;
+
+  const deadlines    = DB.getDeadlines().filter(d => d.bookId === book.id);
+  const nextDeadline = deadlines.find(d => !isPast(d.date));
+  const weeks        = getWeeks(book.id);
+
+  // Questions needing answers (deadline passed, not yet submitted)
+  const pendingWeeks = weeks.filter(w => {
+    if (isUpcoming(w.deadline.date)) return false;
+    const q = DB.getQuestion(w.weekId);
+    return !q?.answers?.[user]?.submittedAt;
+  });
+
+  // Upcoming week where I haven't written my custom question yet
+  const nextWeek = weeks.find(w => isUpcoming(w.deadline.date));
+  const nextQ    = nextWeek ? DB.getQuestion(nextWeek.weekId) : null;
+  const wroteQ   = nextQ ? !!(user === 'jack' ? nextQ.jackWroteForJordan : nextQ.jordanWroteForJack) : true;
+
+  // Progress calculations
+  const pctToDeadline = (myProg?.currentPage && nextDeadline)
+    ? Math.min(100, Math.round(myProg.currentPage / nextDeadline.pageNum * 100))
+    : 0;
+  const pctBook = myProg?.currentPage
+    ? Math.min(100, Math.round(myProg.currentPage / book.totalPages * 100))
+    : 0;
+  const pagesToDeadline = (myProg?.currentPage && nextDeadline)
+    ? Math.max(0, nextDeadline.pageNum - myProg.currentPage)
+    : null;
+  const pagesLeft = myProg?.currentPage
+    ? Math.max(0, book.totalPages - myProg.currentPage)
+    : book.totalPages;
+
+  function motivationLine(pct) {
+    if (pct === 0)   return 'Ready to dive in?';
+    if (pct < 10)    return 'Every page counts — keep going.';
+    if (pct < 25)    return 'Good start. Build the habit.';
+    if (pct < 50)    return 'Finding your rhythm — stay with it.';
+    if (pct === 50)  return 'Halfway there. Don\'t stop now.';
+    if (pct < 75)    return 'Past the halfway point — momentum is everything.';
+    if (pct < 90)    return 'The end is in sight. Finish strong.';
+    if (pct < 100)   return 'Almost done. See it through.';
+    return 'Finished! Time to discuss.';
+  }
+
+  return `
+    <div class="page">
+      <div class="page-header">
+        <div>
+          <h1 class="page-title">Dashboard</h1>
+          <p class="page-subtitle">Good ${timeOfDay()}, ${cap(user)}</p>
+        </div>
+      </div>
+
+      <div class="dashboard-grid">
+
+        <!-- Combined book + progress card (full width) -->
+        <div class="card reading-progress-card">
+          <div class="reading-progress-inner">
+            <div class="reading-info">
+              <div class="card-label">Currently Reading</div>
+              <div class="book-spine-row">
+                <div class="book-spine-bar" style="background:${book.color || '#2D5A27'}"></div>
+                <div>
+                  <h2 class="book-title-large">${book.title}</h2>
+                  <p class="book-author">${book.author}</p>
+                </div>
+              </div>
+              ${nextDeadline ? `
+                <div class="deadline-inline">
+                  <span class="deadline-type-badge-sm ${nextDeadline.type === 'chapter' ? 'badge-chapter' : 'badge-page'}">
+                    ${nextDeadline.type === 'chapter' ? '📖 Ch.' : '🔖 Pg.'}
+                  </span>
+                  <span class="deadline-inline-label">${nextDeadline.label}</span>
+                  <span class="deadline-inline-date">${fmtDate(nextDeadline.date)}</span>
+                  ${daysChip(daysUntil(nextDeadline.date))}
+                </div>
+              ` : `<p class="muted" style="margin-top:12px"><a href="#/deadlines/add">Add a deadline →</a></p>`}
+            </div>
+
+            <div class="progress-inline">
+              <div class="card-label">Your Progress</div>
+
+              <div class="inline-page-row">
+                <div id="page-display" class="page-display" onclick="startPageEdit()" title="Click to update">
+                  <span class="progress-page">${myProg?.currentPage ?? '—'}</span>
+                  <span class="progress-total"> / ${book.totalPages}</span>
+                  <span class="page-edit-hint">edit</span>
+                </div>
+                <div id="page-input-wrap" class="page-input-wrap hidden">
+                  <input id="inline-page-input" type="number" class="form-input page-inline-input"
+                    value="${myProg?.currentPage || ''}" min="1" max="${book.totalPages}"
+                    onkeydown="if(event.key==='Enter')savePageEdit();if(event.key==='Escape')cancelPageEdit();">
+                  <button class="btn btn-primary btn-sm" onclick="savePageEdit()">Save</button>
+                  <button class="btn btn-ghost btn-sm" onclick="cancelPageEdit()">×</button>
+                </div>
+              </div>
+
+              <div class="motivation-stats">
+                <div class="motivation-pct-wrap">
+                  <div class="motivation-pct-bar">
+                    <div class="motivation-pct-fill" style="width:${pctBook}%"></div>
+                  </div>
+                  <span class="motivation-pct-label">${pctBook}% of book</span>
+                </div>
+                ${myProg?.currentPage ? `
+                  <div class="motivation-line">${motivationLine(pctBook)}</div>
+                  <div class="motivation-stats-row">
+                    ${pagesToDeadline !== null ? `
+                      <div class="motivation-stat">
+                        <span class="motivation-stat-val">${pagesToDeadline}</span>
+                        <span class="motivation-stat-label">pages to deadline</span>
+                      </div>
+                    ` : ''}
+                    <div class="motivation-stat">
+                      <span class="motivation-stat-val">${pagesLeft}</span>
+                      <span class="motivation-stat-label">pages left in book</span>
+                    </div>
+                  </div>
+                ` : `<p class="muted" style="margin-top:6px;font-size:12.5px">Click the page number above to log where you are.</p>`}
+              </div>
+
+              <div class="progress-vs">
+                ${cap(other(user))}: ${prog[other(user)]?.currentPage
+                  ? `page ${prog[other(user)].currentPage} · ${Math.round(prog[other(user)].currentPage / book.totalPages * 100)}%`
+                  : 'not started yet'}
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Deadline card -->
+        <div class="card questions-card">
+          <div class="card-label">Questions</div>
+          ${pendingWeeks.length > 0 ? `
+            <div class="pending-questions">
+              <span class="badge badge-amber">${pendingWeeks.length} unanswered</span>
+              ${pendingWeeks.slice(0,2).map(w => `
+                <a href="#/questions/week/${w.weekId}" class="pending-q-link">
+                  ${w.label} — ${fmtDate(w.deadline.date)}
+                </a>`).join('')}
+            </div>
+          ` : `<p class="muted" style="margin-bottom:8px">All caught up! ✓</p>`}
+          ${!wroteQ && nextWeek ? `
+            <div class="write-question-nudge">
+              <span class="badge badge-pine">Write a question for ${cap(other(user))}</span>
+              <a href="#/questions/week/${nextWeek.weekId}" class="pending-q-link">
+                ${nextWeek.label} — ${fmtDate(nextWeek.deadline.date)}
+              </a>
+            </div>
+          ` : ''}
+          <a href="#/questions" class="btn btn-secondary mt-3">View All Weeks</a>
+        </div>
+
+        <!-- Quick links card -->
+        <div class="card" style="display:flex;flex-direction:column;gap:8px;justify-content:center">
+          <div class="card-label">Jump To</div>
+          <a href="#/deadlines/add" class="btn btn-secondary" style="justify-content:center">+ Add Deadline</a>
+          <a href="#/books" class="btn btn-ghost" style="justify-content:center;border:1px solid var(--border-dark)">Manage Books</a>
+          <a href="#/progress" class="btn btn-ghost" style="justify-content:center;border:1px solid var(--border-dark)">Full Progress</a>
+        </div>
+
+      </div>
+    </div>`;
+}
+
+// ============================================================
+// INLINE PAGE EDIT (dashboard)
+// ============================================================
+function startPageEdit() {
+  document.getElementById('page-display')?.classList.add('hidden');
+  const wrap = document.getElementById('page-input-wrap');
+  wrap?.classList.remove('hidden');
+  const input = document.getElementById('inline-page-input');
+  if (input) { input.focus(); input.select(); }
+}
+
+function cancelPageEdit() {
+  document.getElementById('page-input-wrap')?.classList.add('hidden');
+  document.getElementById('page-display')?.classList.remove('hidden');
+}
+
+function savePageEdit() {
+  const input = document.getElementById('inline-page-input');
+  const page  = parseInt(input?.value);
+  if (!page || page < 1) { cancelPageEdit(); return; }
+  DB.updateProgress(DB.getUser(), page);
+  handleRoute();
+}
+
+// ============================================================
+// LOG MODAL (progress page)
+// ============================================================
+function logModal(book, myProg) {
+  return `
+    <div id="log-modal" class="modal-backdrop hidden">
+      <div class="modal">
+        <div class="modal-header">
+          <h3>Log Pages Read</h3>
+          <button class="modal-close" onclick="closeLogModal()">×</button>
+        </div>
+        <div class="modal-body">
+          <label class="form-label">Current page</label>
+          <input type="number" id="log-page-input" class="form-input"
+            placeholder="${myProg?.currentPage || ''}" min="1" max="${book?.totalPages || 9999}">
+        </div>
+        <div class="modal-footer">
+          <button class="btn btn-ghost" onclick="closeLogModal()">Cancel</button>
+          <button class="btn btn-primary" onclick="submitLogPages()">Save</button>
+        </div>
+      </div>
+    </div>`;
+}
+
+function openLogModal()  { document.getElementById('log-modal')?.classList.remove('hidden'); document.getElementById('log-page-input')?.focus(); }
+function closeLogModal() { document.getElementById('log-modal')?.classList.add('hidden'); }
+
+function submitLogPages() {
+  const input = document.getElementById('log-page-input');
+  const page  = parseInt(input?.value);
+  if (!page || page < 1) return;
+  DB.updateProgress(DB.getUser(), page);
+  closeLogModal();
+  handleRoute();
+}
+
+// ============================================================
+// PAGE: BOOKS
+// ============================================================
+function pageBooks() {
+  const books  = DB.getBooks();
+  const active = DB.getActiveBook();
+
+  return `
+    <div class="page">
+      <div class="page-header">
+        <div>
+          <h1 class="page-title">Books</h1>
+          <p class="page-subtitle">${books.length} book${books.length !== 1 ? 's' : ''}</p>
+        </div>
+        <a href="#/books/add" class="btn btn-primary">+ Add Book</a>
+      </div>
+      ${books.length === 0 ? `
+        <div class="empty-state">
+          <div class="empty-icon">📖</div>
+          <h3>No books yet</h3>
+          <p>Add your first book to get started.</p>
+          <a href="#/books/add" class="btn btn-primary">Add a Book</a>
+        </div>
+      ` : `
+        <div class="book-list">
+          ${books.map(b => `
+            <div class="card book-list-card ${b.isActive ? 'book-active' : ''}">
+              <div class="book-list-info">
+                <div class="book-list-spine" style="background:${b.color || '#2D5A27'}"></div>
+                <div>
+                  <div class="book-list-title">${b.title}</div>
+                  <div class="book-list-author">${b.author}</div>
+                  <div class="book-list-pages">${b.totalPages} pages</div>
+                </div>
+              </div>
+              <div class="book-list-actions">
+                ${b.isActive
+                  ? `<span class="badge badge-pine">Active</span>`
+                  : `<button class="btn btn-ghost btn-sm" onclick="setActiveBook('${b.id}')">Set Active</button>`}
+                <a href="#/books/edit/${b.id}" class="btn btn-ghost btn-sm">Edit</a>
+                <button class="btn btn-ghost btn-sm btn-danger" onclick="confirmDeleteBook('${b.id}')">Delete</button>
+              </div>
+            </div>`).join('')}
+        </div>`}
+    </div>`;
+}
+
+function setActiveBook(id)       { DB.setActiveBook(id); navigate('/books'); }
+function confirmDeleteBook(id)   {
+  if (confirm('Delete this book? All deadlines and questions for it will also be removed.')) {
+    DB.deleteBook(id);
+    DB._set('deadlines', DB.getDeadlines().filter(d => d.bookId !== id));
+    DB._set('questions', DB.getQuestions().filter(q => q.bookId !== id));
+    navigate('/books');
+  }
+}
+
+// ============================================================
+// PAGE: ADD / EDIT BOOK
+// ============================================================
+const SPINE_COLORS = ['#2D5A27','#4E7FA0','#8B6914','#7B5EA7','#B83232','#2C7873','#A06030'];
+
+function pageBookForm(book) {
+  const isEdit = !!book;
+  return `
+    <div class="page">
+      <div class="page-header">
+        <div><h1 class="page-title">${isEdit ? 'Edit Book' : 'Add a Book'}</h1></div>
+        <a href="#/books" class="btn btn-ghost">← Back</a>
+      </div>
+      <div class="card form-card">
+        <form onsubmit="saveBook(event,'${book?.id || ''}')">
+          <div class="form-group">
+            <label class="form-label">Title *</label>
+            <input name="title" type="text" class="form-input" required value="${book?.title || ''}" placeholder="e.g. The Goldfinch">
+          </div>
+          <div class="form-group">
+            <label class="form-label">Author *</label>
+            <input name="author" type="text" class="form-input" required value="${book?.author || ''}" placeholder="e.g. Donna Tartt">
+          </div>
+          <div class="form-group">
+            <label class="form-label">Total Pages *</label>
+            <input name="totalPages" type="number" class="form-input" required min="1" value="${book?.totalPages || ''}" placeholder="e.g. 352">
+          </div>
+          <div class="form-group">
+            <label class="form-label">Spine Color</label>
+            <div class="color-picker">
+              ${SPINE_COLORS.map(c => `
+                <label class="color-option">
+                  <input type="radio" name="color" value="${c}" ${(book?.color || SPINE_COLORS[0]) === c ? 'checked' : ''}>
+                  <span class="color-swatch" style="background:${c}"></span>
+                </label>`).join('')}
+            </div>
+          </div>
+          <div class="form-actions">
+            <a href="#/books" class="btn btn-ghost">Cancel</a>
+            <button type="submit" class="btn btn-primary">${isEdit ? 'Save Changes' : 'Add Book'}</button>
+          </div>
+        </form>
+      </div>
+    </div>`;
+}
+
+function saveBook(e, existingId) {
+  e.preventDefault();
+  const d     = Object.fromEntries(new FormData(e.target));
+  const books = DB.getBooks();
+  const isFirst = books.length === 0 && !existingId;
+  const existing = existingId ? books.find(b => b.id === existingId) : null;
+
+  DB.saveBook({
+    id:         existingId || uid(),
+    title:      d.title.trim(),
+    author:     d.author.trim(),
+    totalPages: parseInt(d.totalPages),
+    color:      d.color || SPINE_COLORS[0],
+    isActive:   existing ? existing.isActive : isFirst,
+    createdAt:  existing?.createdAt || new Date().toISOString(),
+  });
+  navigate('/books');
+}
+
+// ============================================================
+// PAGE: DEADLINES
+// ============================================================
+function pageDeadlines() {
+  const book = DB.getActiveBook();
+  if (!book) return noBookPage('Deadlines');
+
+  const deadlines = DB.getDeadlines().filter(d => d.bookId === book.id);
+
+  return `
+    <div class="page">
+      <div class="page-header">
+        <div>
+          <h1 class="page-title">Deadlines</h1>
+          <p class="page-subtitle">${book.title}</p>
+        </div>
+        <a href="#/deadlines/add" class="btn btn-primary">+ Add Deadline</a>
+      </div>
+      <div class="deadlines-layout">
+        <div>${miniCalendar(deadlines)}</div>
+        <div>
+          ${deadlines.length === 0 ? `
+            <div class="empty-state">
+              <div class="empty-icon">📅</div>
+              <h3>No deadlines yet</h3>
+              <p>Add chapter or page-stop deadlines to track your pace.</p>
+              <a href="#/deadlines/add" class="btn btn-primary">Add First Deadline</a>
+            </div>
+          ` : `
+            <div class="deadline-list">
+              ${deadlines.map((d, i) => `
+                <div class="card deadline-list-card ${isPast(d.date) ? 'deadline-past' : ''}">
+                  <div class="deadline-list-week">Week ${i+1}</div>
+                  <div class="deadline-list-main">
+                    <div class="deadline-type-badge ${d.type === 'chapter' ? 'badge-chapter' : 'badge-page'}">
+                      ${d.type === 'chapter' ? '📖 End of Chapter' : '🔖 Page Stop'}
+                    </div>
+                    <div class="deadline-list-label">${d.label}</div>
+                    <div class="deadline-list-page">Through page ${d.pageNum}</div>
+                  </div>
+                  <div class="deadline-list-right">
+                    <div class="deadline-list-date">${fmtDate(d.date)}</div>
+                    ${daysChip(daysUntil(d.date))}
+                    <button class="btn btn-ghost btn-sm btn-danger" onclick="confirmDeleteDeadline('${d.id}')">Delete</button>
+                  </div>
+                </div>`).join('')}
+            </div>`}
+        </div>
+      </div>
+    </div>`;
+}
+
+function miniCalendar(deadlines) {
+  const now   = new Date();
+  const y     = now.getFullYear();
+  const m     = now.getMonth();
+  const first = new Date(y, m, 1).getDay();
+  const days  = new Date(y, m + 1, 0).getDate();
+  const dlMap = {};
+  deadlines.forEach(d => { dlMap[d.date] = d; });
+
+  let cells = Array(first).fill(`<div class="cal-cell cal-empty"></div>`).join('');
+  for (let d = 1; d <= days; d++) {
+    const ds  = `${y}-${String(m+1).padStart(2,'0')}-${String(d).padStart(2,'0')}`;
+    const dl  = dlMap[ds];
+    const tod = d === now.getDate();
+    cells += `
+      <div class="cal-cell ${tod ? 'cal-today' : ''} ${dl ? 'cal-has-deadline' : ''}">
+        <span class="cal-day">${d}</span>
+        ${dl ? `<span class="cal-dot cal-dot-${dl.type}"></span>` : ''}
+      </div>`;
+  }
+
+  const monthLabel = now.toLocaleDateString('en-US', { month: 'long', year: 'numeric' });
+  return `
+    <div class="card calendar-card">
+      <div class="calendar-header">${monthLabel}</div>
+      <div class="cal-grid">
+        ${['Su','Mo','Tu','We','Th','Fr','Sa'].map(d => `<div class="cal-cell cal-header">${d}</div>`).join('')}
+        ${cells}
+      </div>
+      <div class="cal-legend">
+        <span class="cal-legend-item"><span class="cal-dot cal-dot-chapter"></span> End of chapter</span>
+        <span class="cal-legend-item"><span class="cal-dot cal-dot-page"></span> Page stop</span>
+      </div>
+    </div>`;
+}
+
+function confirmDeleteDeadline(id) {
+  if (confirm('Delete this deadline?')) { DB.deleteDeadline(id); navigate('/deadlines'); }
+}
+
+// ============================================================
+// PAGE: ADD DEADLINE
+// ============================================================
+function pageAddDeadline() {
+  const book  = DB.getActiveBook();
+  const week  = DB.getDeadlines().filter(d => d.bookId === book?.id).length + 1;
+
+  return `
+    <div class="page">
+      <div class="page-header">
+        <div>
+          <h1 class="page-title">Add Deadline</h1>
+          <p class="page-subtitle">${book?.title || ''} · Week ${week}</p>
+        </div>
+        <a href="#/deadlines" class="btn btn-ghost">← Back</a>
+      </div>
+      <div class="card form-card">
+        <form onsubmit="saveDeadline(event)">
+
+          <div class="form-group">
+            <label class="form-label">Deadline Type *</label>
+            <div class="type-toggle">
+              <label class="type-option">
+                <input type="radio" name="type" value="chapter" checked onchange="onTypeChange(this)">
+                <span class="type-option-inner">
+                  <span class="type-icon">📖</span>
+                  <span class="type-label">End of Chapter</span>
+                  <span class="type-desc">Read through the end of a complete chapter</span>
+                </span>
+              </label>
+              <label class="type-option">
+                <input type="radio" name="type" value="page" onchange="onTypeChange(this)">
+                <span class="type-option-inner">
+                  <span class="type-icon">🔖</span>
+                  <span class="type-label">Page Stop</span>
+                  <span class="type-desc">Stop partway through a chapter at a specific page</span>
+                </span>
+              </label>
+            </div>
+          </div>
+
+          <div id="chapter-field" class="form-group">
+            <label class="form-label">Chapter Number *</label>
+            <input id="chapter-num" type="number" name="chapterNum" class="form-input" min="1" placeholder="e.g. 5">
+          </div>
+
+          <div class="form-group">
+            <label class="form-label">Through Page *</label>
+            <p class="form-hint">The last page to be read by this deadline</p>
+            <input type="number" name="pageNum" class="form-input" required min="1" max="${book?.totalPages || 9999}" placeholder="e.g. 87">
+          </div>
+
+          <div class="form-group">
+            <label class="form-label">Custom Label <span class="form-optional">(optional)</span></label>
+            <p class="form-hint">Leave blank to auto-generate, e.g. "End of Chapter 5" or "Page 87"</p>
+            <input type="text" name="customLabel" class="form-input" placeholder="e.g. Through the dream sequence">
+          </div>
+
+          <div class="form-group">
+            <label class="form-label">Due Date *</label>
+            <input type="date" name="date" class="form-input" required>
+          </div>
+
+          <div class="form-actions">
+            <a href="#/deadlines" class="btn btn-ghost">Cancel</a>
+            <button type="submit" class="btn btn-primary">Add Deadline</button>
+          </div>
+        </form>
+      </div>
+    </div>`;
+}
+
+function onTypeChange(radio) {
+  const field = document.getElementById('chapter-field');
+  const input = document.getElementById('chapter-num');
+  if (radio.value === 'chapter') {
+    field.style.display = '';
+    input.required = true;
+  } else {
+    field.style.display = 'none';
+    input.required = false;
+    input.value = '';
+  }
+}
+
+function saveDeadline(e) {
+  e.preventDefault();
+  const book = DB.getActiveBook();
+  if (!book) return;
+  const d     = Object.fromEntries(new FormData(e.target));
+  const type  = d.type;
+  const page  = parseInt(d.pageNum);
+  const ch    = d.chapterNum ? parseInt(d.chapterNum) : null;
+  const label = d.customLabel?.trim() || (type === 'chapter' && ch ? `End of Chapter ${ch}` : `Page ${page}`);
+
+  DB.saveDeadline({ id: uid(), bookId: book.id, type, label, chapterNum: ch, pageNum: page, date: d.date, createdAt: new Date().toISOString() });
+  navigate('/deadlines');
+}
+
+// ============================================================
+// PAGE: PROGRESS
+// ============================================================
+function pageProgress() {
+  const user  = DB.getUser();
+  const book  = DB.getActiveBook();
+  const prog  = DB.getProgress();
+  const jackP = prog.jack;
+  const jorP  = prog.jordan;
+
+  if (!book) return noBookPage('Progress');
+
+  const deadlines = DB.getDeadlines().filter(d => d.bookId === book.id);
+
+  return `
+    <div class="page">
+      <div class="page-header">
+        <div>
+          <h1 class="page-title">Reading Progress</h1>
+          <p class="page-subtitle">${book.title}</p>
+        </div>
+        <button class="btn btn-primary" onclick="openLogModal()">Log Pages</button>
+      </div>
+
+      <div class="progress-page-layout">
+
+        <div class="card">
+          <div class="card-label">Side by Side</div>
+          <div class="progress-comparison">
+            ${progressBar('Jack',   jackP?.currentPage, book.totalPages, 'var(--pine)')}
+            ${progressBar('Jordan', jorP?.currentPage,  book.totalPages, 'var(--sky)')}
+          </div>
+        </div>
+
+        ${deadlines.length > 0 ? `
+          <div class="card">
+            <div class="card-label">Deadline Checkpoints</div>
+            <div class="deadline-progress-list">
+              ${deadlines.map((d, i) => {
+                const jDone = jackP?.currentPage >= d.pageNum;
+                const rDone = jorP?.currentPage  >= d.pageNum;
+                return `
+                  <div class="deadline-progress-item">
+                    <div class="deadline-progress-left">
+                      <span class="deadline-progress-week">Wk ${i+1}</span>
+                      <span class="deadline-type-badge-sm ${d.type === 'chapter' ? 'badge-chapter' : 'badge-page'}">
+                        ${d.type === 'chapter' ? 'Ch.' : 'Pg.'}
+                      </span>
+                      <span class="deadline-progress-label">${d.label}</span>
+                      <span class="deadline-progress-date muted">${fmtDate(d.date)}</span>
+                    </div>
+                    <div class="deadline-progress-right">
+                      <span class="deadline-progress-user ${jDone ? 'done' : isPast(d.date) ? 'late' : ''}">
+                        ${jDone ? '✓' : isPast(d.date) ? '✗' : '○'} Jack
+                      </span>
+                      <span class="deadline-progress-user ${rDone ? 'done' : isPast(d.date) ? 'late' : ''}">
+                        ${rDone ? '✓' : isPast(d.date) ? '✗' : '○'} Jordan
+                      </span>
+                    </div>
+                  </div>`;
+              }).join('')}
+            </div>
+          </div>` : ''}
+
+        ${(jackP?.history?.length || jorP?.history?.length) ? `
+          <div class="card">
+            <div class="card-label">Recent Logs</div>
+            <div class="history-list">
+              ${[...(jackP?.history?.map(h => ({ ...h, who: 'Jack' })) || []),
+                 ...(jorP?.history?.map(h => ({ ...h, who: 'Jordan' })) || [])]
+                .sort((a, b) => new Date(b.date) - new Date(a.date))
+                .slice(0, 12)
+                .map(h => `
+                  <div class="history-item">
+                    <span class="history-user ${h.who.toLowerCase()}">${h.who}</span>
+                    <span class="history-page">page ${h.page}</span>
+                    <span class="history-date muted">${fmtDate(h.date.split('T')[0])}</span>
+                  </div>`).join('')}
+            </div>
+          </div>` : ''}
+
+      </div>
+
+      ${logModal(book, prog[user])}
+    </div>`;
+}
+
+function progressBar(name, currentPage, totalPages, color) {
+  const pct = currentPage ? Math.min(100, Math.round(currentPage / totalPages * 100)) : 0;
+  return `
+    <div class="progress-bar-row">
+      <div class="progress-bar-name">${name}</div>
+      <div class="progress-bar-main">
+        <div class="progress-bar-track">
+          <div class="progress-bar-fill" style="width:${pct}%;background:${color}"></div>
+        </div>
+        <span class="progress-bar-pct">${pct}%</span>
+      </div>
+      <div class="progress-bar-page">${currentPage ? `Page ${currentPage}` : 'Not started'} / ${totalPages}</div>
+    </div>`;
+}
+
+// ============================================================
+// PAGE: QUESTIONS LIST
+// ============================================================
+function pageQuestions() {
+  const book = DB.getActiveBook();
+  if (!book) return noBookPage('Questions');
+
+  const user  = DB.getUser();
+  const weeks = getWeeks(book.id);
+
+  return `
+    <div class="page">
+      <div class="page-header">
+        <div>
+          <h1 class="page-title">Questions</h1>
+          <p class="page-subtitle">${book.title}</p>
+        </div>
+      </div>
+      ${weeks.length === 0 ? `
+        <div class="empty-state">
+          <div class="empty-icon">💬</div>
+          <h3>No reading weeks yet</h3>
+          <p>Add deadlines to create weekly reading periods with discussion questions.</p>
+          <a href="#/deadlines/add" class="btn btn-primary">Add a Deadline</a>
+        </div>
+      ` : `
+        <div class="weeks-list">
+          ${weeks.map(w => {
+            const q           = DB.getQuestion(w.weekId);
+            const mine        = !!q?.answers?.[user]?.submittedAt;
+            const theirs      = !!q?.answers?.[other(user)]?.submittedAt;
+            const upcoming    = isUpcoming(w.deadline.date);
+            const iWrote      = user === 'jack' ? q?.jackWroteForJordan : q?.jordanWroteForJack;
+            const theyWrote   = user === 'jack' ? q?.jordanWroteForJack : q?.jackWroteForJordan;
+            const bothWrote   = !!(iWrote && theyWrote);
+
+            return `
+              <a href="#/questions/week/${w.weekId}" class="card week-card ${upcoming ? 'week-upcoming' : ''}">
+                <div class="week-card-left">
+                  <div class="week-number">${w.label}</div>
+                  <div class="week-deadline-label">${w.deadline.label}</div>
+                  <div class="week-date muted">${fmtDate(w.deadline.date)}</div>
+                </div>
+                <div class="week-card-right">
+                  ${upcoming ? `<span class="badge badge-stone">Upcoming</span>` : ''}
+                  ${upcoming && !iWrote ? `<span class="badge badge-amber">Write your question</span>` : ''}
+                  ${upcoming && iWrote && !bothWrote ? `<span class="badge badge-sky">Waiting for ${cap(other(user))}</span>` : ''}
+                  ${upcoming && bothWrote ? `<span class="badge badge-pine">Questions revealed</span>` : ''}
+                  ${mine   ? `<span class="badge badge-pine">You answered</span>` : !upcoming ? `<span class="badge badge-amber">Needs answer</span>` : ''}
+                  ${theirs ? `<span class="badge badge-pine">${cap(other(user))} answered</span>` : ''}
+                  ${icons.chevron}
+                </div>
+              </a>`;
+          }).join('')}
+        </div>`}
+    </div>`;
+}
+
+// ============================================================
+// PAGE: WEEK QUESTIONS DETAIL
+// ============================================================
+function pageWeekQuestions(weekId) {
+  const book = DB.getActiveBook();
+  const user = DB.getUser();
+  const them = other(user);
+  const weeks = book ? getWeeks(book.id) : [];
+  const week  = weeks.find(w => w.weekId === weekId);
+
+  if (!week) return `<div class="page"><div class="empty-state"><p>Week not found.</p><a href="#/questions" class="btn btn-ghost">← Back</a></div></div>`;
+
+  const q             = DB.getQuestion(weekId) || blankQuestion(weekId, book.id);
+  const upcoming      = isUpcoming(week.deadline.date);
+  const myAnswers     = q.answers?.[user]  || {};
+  const theirAnswers  = q.answers?.[them]  || {};
+  const mySubmitted   = !!myAnswers.submittedAt;
+  const theirSubmitted= !!theirAnswers.submittedAt;
+
+  const jackQ     = q.jackWroteForJordan;
+  const jordanQ   = q.jordanWroteForJack;
+  const bothWrote = !!(jackQ && jordanQ);
+  // Only revealed once BOTH parties have submitted their custom question
+  const questionForMe  = bothWrote ? (user === 'jack' ? jordanQ : jackQ) : null;
+  const questionIWrote = user === 'jack' ? jackQ : jordanQ;
+
+  return `
+    <div class="page">
+      <div class="page-header">
+        <div>
+          <h1 class="page-title">${week.label}</h1>
+          <p class="page-subtitle">${week.deadline.label} · ${fmtDate(week.deadline.date)}</p>
+        </div>
+        <a href="#/questions" class="btn btn-ghost">← Back</a>
+      </div>
+
+      ${questionForMe ? `
+        <div class="card question-preview-card" style="border-left:3px solid var(--sky);background:var(--sky-pale);margin-bottom:16px">
+          <div class="card-label">💬 ${cap(them)}'s question for you</div>
+          <p class="question-text">"${questionForMe}"</p>
+          ${upcoming ? `<p class="muted-sm">Think about this while reading — you'll answer it when the deadline arrives.</p>` : ''}
+        </div>
+      ` : !bothWrote && upcoming ? `
+        <div class="card" style="background:var(--cream);border-color:var(--border);margin-bottom:16px;padding:14px 18px">
+          ${(user === 'jack' ? jordanQ : jackQ) ? `
+            <p class="muted-sm">⏳ ${cap(them)} wrote a question for you — it'll appear once you've both submitted yours.</p>
+          ` : `
+            <p class="muted-sm">${cap(them)} hasn't written your question for this week yet.</p>
+          `}
+        </div>
+      ` : ''}
+
+      ${!questionIWrote ? `
+        <div class="card write-question-card" style="margin-bottom:16px">
+          <div class="card-label">✍️ Write a question for ${cap(them)}</div>
+          <p class="muted" style="margin-bottom:12px">Both questions are revealed together once you've each submitted one.</p>
+          <form onsubmit="saveCustomQ(event,'${weekId}')">
+            <textarea name="question" class="form-input form-textarea" required
+              placeholder="What do you want ${cap(them)} to reflect on this week?"></textarea>
+            <div class="form-actions">
+              <button type="submit" class="btn btn-primary">Save Question</button>
+            </div>
+          </form>
+        </div>
+      ` : bothWrote ? `
+        <div class="card write-question-card written" style="margin-bottom:16px">
+          <div class="card-label">✍️ Your question for ${cap(them)}</div>
+          <p class="question-text">"${questionIWrote}"</p>
+          <p class="muted-sm">Both questions are now revealed</p>
+        </div>
+      ` : `
+        <div class="card write-question-card written waiting" style="margin-bottom:16px">
+          <div class="card-label">✍️ Your question for ${cap(them)}</div>
+          <p class="question-text">"${questionIWrote}"</p>
+          <p class="muted-sm">⏳ Waiting for ${cap(them)} to write their question — questions reveal together</p>
+        </div>
+      `}
+
+      ${upcoming ? `
+        <div class="card upcoming-notice" style="margin-bottom:16px">
+          <div class="upcoming-notice-inner">
+            <div class="upcoming-icon">🏔️</div>
+            <div>
+              <h3>Keep reading</h3>
+              <p>This period ends on ${fmtDate(week.deadline.date)}. Come back then to answer the discussion questions.</p>
+            </div>
+          </div>
+        </div>
+
+      ` : mySubmitted ? `
+        <div class="card answers-card" style="margin-bottom:16px">
+          <div class="card-label">Your Answers · ${fmtDate(myAnswers.submittedAt?.split('T')[0])}</div>
+          <div class="answer-block">
+            <div class="answer-q">What resonated with you?</div>
+            <div class="answer-a">${myAnswers.resonated || '—'}</div>
+          </div>
+          <div class="answer-block">
+            <div class="answer-q">What did you disagree with?</div>
+            <div class="answer-a">${myAnswers.disagreed || '—'}</div>
+          </div>
+          ${questionForMe && myAnswers.custom ? `
+            <div class="answer-block">
+              <div class="answer-q">${cap(them)} asked: "${questionForMe}"</div>
+              <div class="answer-a">${myAnswers.custom}</div>
+            </div>` : ''}
+        </div>
+
+        ${theirSubmitted ? `
+          <div class="card answers-card answers-other" style="margin-bottom:16px">
+            <div class="card-label">${cap(them)}'s Answers · ${fmtDate(theirAnswers.submittedAt?.split('T')[0])}</div>
+            <div class="answer-block">
+              <div class="answer-q">What resonated with them?</div>
+              <div class="answer-a">${theirAnswers.resonated || '—'}</div>
+            </div>
+            <div class="answer-block">
+              <div class="answer-q">What did they disagree with?</div>
+              <div class="answer-a">${theirAnswers.disagreed || '—'}</div>
+            </div>
+            ${questionIWrote && theirAnswers.custom ? `
+              <div class="answer-block">
+                <div class="answer-q">You asked: "${questionIWrote}"</div>
+                <div class="answer-a">${theirAnswers.custom}</div>
+              </div>` : ''}
+          </div>
+        ` : `
+          <div class="card waiting-card">
+            <p class="muted">Waiting for ${cap(them)} to submit their answers…</p>
+          </div>`}
+
+      ` : `
+        ${theirSubmitted ? `
+          <div class="card" style="background:var(--pine-pale);border-color:var(--pine);padding:12px 18px;margin-bottom:16px">
+            <p class="muted-sm">${cap(them)} has already answered. Submit yours to see their responses.</p>
+          </div>` : ''}
+
+        <div class="card answer-form-card" style="margin-bottom:16px">
+          <div class="card-label">Your Answers</div>
+          <form onsubmit="submitAnswers(event,'${weekId}')">
+            <div class="form-group">
+              <label class="form-label question-label">What resonated with you this week? *</label>
+              <textarea name="resonated" class="form-input form-textarea" required
+                placeholder="Something that moved you, clicked, or stuck with you…"></textarea>
+            </div>
+            <div class="form-group">
+              <label class="form-label question-label">What did you disagree with? *</label>
+              <textarea name="disagreed" class="form-input form-textarea" required
+                placeholder="Something that didn't sit right, felt off, or you'd push back on…"></textarea>
+            </div>
+            ${questionForMe ? `
+              <div class="form-group">
+                <label class="form-label question-label custom-q-label">${cap(them)} asks: "${questionForMe}" *</label>
+                <textarea name="custom" class="form-input form-textarea" required
+                  placeholder="Your answer…"></textarea>
+              </div>` : ''}
+            <div class="form-actions" style="flex-direction:column;align-items:flex-start;gap:8px">
+              <p class="muted-sm">Once you submit, ${cap(them)} can read your answers after they submit theirs.</p>
+              <button type="submit" class="btn btn-primary">Submit Answers</button>
+            </div>
+          </form>
+        </div>`}
+
+    </div>`;
+}
+
+function saveCustomQ(e, weekId) {
+  e.preventDefault();
+  const user = DB.getUser();
+  const book = DB.getActiveBook();
+  const q    = DB.getQuestion(weekId) || blankQuestion(weekId, book.id);
+  const text = Object.fromEntries(new FormData(e.target)).question.trim();
+  if (!text) return;
+
+  if (user === 'jack') q.jackWroteForJordan = text;
+  else                 q.jordanWroteForJack = text;
+
+  DB.saveQuestion(q);
+  navigate(`/questions/week/${weekId}`);
+}
+
+function submitAnswers(e, weekId) {
+  e.preventDefault();
+  const user = DB.getUser();
+  const book = DB.getActiveBook();
+  const q    = DB.getQuestion(weekId) || blankQuestion(weekId, book.id);
+  const d    = Object.fromEntries(new FormData(e.target));
+
+  q.answers[user] = {
+    resonated:   d.resonated.trim(),
+    disagreed:   d.disagreed.trim(),
+    custom:      d.custom?.trim() || null,
+    submittedAt: new Date().toISOString(),
+  };
+
+  DB.saveQuestion(q);
+  navigate(`/questions/week/${weekId}`);
+}
+
+// ============================================================
+// PAGE: NOTES
+// ============================================================
+function pageNotes() {
+  const user  = DB.getUser();
+  const them  = other(user);
+  const notes = DB.getNotes();
+
+  return `
+    <div class="page">
+      <div class="page-header">
+        <div>
+          <h1 class="page-title">Notes</h1>
+          <p class="page-subtitle">Thoughts, reactions, and page references</p>
+        </div>
+      </div>
+
+      <div class="card note-add-card">
+        <div class="card-label">✍️ Add a note</div>
+        <form onsubmit="addNote(event)" class="note-form">
+          <textarea name="text" class="form-input form-textarea" required
+            placeholder="What caught your attention?"></textarea>
+          <div class="note-form-footer">
+            <div class="note-page-field">
+              <label class="form-label" style="margin-bottom:4px">Page</label>
+              <input type="number" name="page" class="form-input note-page-input"
+                placeholder="—" min="1">
+            </div>
+            <button type="submit" class="btn btn-primary">Add Note</button>
+          </div>
+        </form>
+      </div>
+
+      ${notes.length === 0 ? `
+        <div class="empty-state" style="margin-top:24px">
+          <div class="empty-icon">📝</div>
+          <h3>No notes yet</h3>
+          <p>Capture a thought while it's fresh — page numbers optional but useful for discussion.</p>
+        </div>
+      ` : `
+        <div class="notes-feed">
+          ${notes.map(n => `
+            <div class="note-card card ${n.author === user ? 'note-mine' : 'note-theirs'}">
+              <div class="note-meta">
+                <span class="note-author">${cap(n.author)}</span>
+                ${n.page ? `<span class="note-page">p. ${n.page}</span>` : ''}
+                <span class="note-date muted">${fmtDate(n.createdAt.split('T')[0])}</span>
+                ${n.author === user ? `
+                  <button class="note-delete btn-ghost-sm" onclick="deleteNote('${n.id}')">✕</button>
+                ` : ''}
+              </div>
+              <p class="note-text">${n.text}</p>
+            </div>
+          `).join('')}
+        </div>
+      `}
+    </div>`;
+}
+
+function addNote(e) {
+  e.preventDefault();
+  const user = DB.getUser();
+  const d    = Object.fromEntries(new FormData(e.target));
+  const text = d.text.trim();
+  if (!text) return;
+
+  DB.saveNote({
+    id:        crypto.randomUUID(),
+    author:    user,
+    text,
+    page:      d.page ? parseInt(d.page) : null,
+    createdAt: new Date().toISOString(),
+  });
+  e.target.reset();
+  navigate('/notes');
+}
+
+function deleteNote(id) {
+  DB.deleteNote(id);
+  navigate('/notes');
+}
+
+// ============================================================
+// HELPER: NO BOOK STATE
+// ============================================================
+function noBookPage(title) {
+  return `
+    <div class="page">
+      <div class="page-header"><div><h1 class="page-title">${title}</h1></div></div>
+      <div class="empty-state">
+        <p>Add a book first to use this section.</p>
+        <a href="#/books/add" class="btn btn-primary">Add a Book</a>
+      </div>
+    </div>`;
+}
+
+// ============================================================
+// INIT
+// ============================================================
+function seedDefaultData() {
+  if (DB.getBooks().length > 0) return;
+  DB.saveBook({
+    id: 'lean-startup',
+    title: 'The Lean Startup',
+    author: 'Eric Ries',
+    totalPages: 336,
+    color: '#2D5A27',
+    isActive: true,
+    createdAt: new Date().toISOString(),
+  });
+}
+
+document.addEventListener('DOMContentLoaded', async () => {
+  seedDefaultData();
+  await Sync.pull(); // fetch remote state before first render so we show latest data
+  handleRoute();
+});
