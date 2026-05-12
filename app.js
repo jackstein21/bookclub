@@ -231,7 +231,8 @@ function handleRoute() {
   else if (hash === '/books/add')                 content = pageBookForm(null);
   else if (hash.startsWith('/books/edit/'))       content = pageBookForm(DB.getBooks().find(b => b.id === parts[2]));
   else if (hash === '/deadlines')                 content = pageDeadlines();
-  else if (hash === '/deadlines/add')             content = pageAddDeadline();
+  else if (hash === '/deadlines/add')             content = pageAddDeadline(null);
+  else if (hash.startsWith('/deadlines/edit/'))   content = pageAddDeadline(DB.getDeadlines().find(d => d.id === parts[2]));
   else if (hash === '/progress')                  content = pageProgress();
   else if (hash === '/questions')                 content = pageQuestions();
   else if (hash.startsWith('/questions/week/'))   content = pageWeekQuestions(parts[2]);
@@ -748,8 +749,11 @@ function pageDeadlines() {
           ` : `
             <div class="deadline-list">
               ${deadlines.map((d, i) => `
-                <div class="card deadline-list-card ${isPast(d.date) ? 'deadline-past' : ''}">
-                  <div class="deadline-list-week">Week ${i+1}</div>
+                <div class="card deadline-list-card ${isPast(d.date) ? 'deadline-past' : ''} ${d.isFinal ? 'deadline-final' : ''}">
+                  <div class="deadline-list-week">
+                    Week ${i+1}
+                    ${d.isFinal ? '<span class="final-badge">Final</span>' : ''}
+                  </div>
                   <div class="deadline-list-main">
                     <div class="deadline-type-badge ${d.type === 'chapter' ? 'badge-chapter' : 'badge-page'}">
                       ${d.type === 'chapter' ? '📖 End of Chapter' : '🔖 Page Stop'}
@@ -760,7 +764,10 @@ function pageDeadlines() {
                   <div class="deadline-list-right">
                     <div class="deadline-list-date">${fmtDate(d.date)}</div>
                     ${daysChip(daysUntil(d.date))}
-                    <button class="btn btn-ghost btn-sm btn-danger" onclick="confirmDeleteDeadline('${d.id}')">Delete</button>
+                    <div class="deadline-actions">
+                      <a href="#/deadlines/edit/${d.id}" class="btn btn-ghost btn-sm">Edit</a>
+                      <button class="btn btn-ghost btn-sm btn-danger" onclick="confirmDeleteDeadline('${d.id}')">Delete</button>
+                    </div>
                   </div>
                 </div>`).join('')}
             </div>`}
@@ -769,10 +776,13 @@ function pageDeadlines() {
     </div>`;
 }
 
+let _calOffset = 0;
+
 function miniCalendar(deadlines) {
   const now   = new Date();
-  const y     = now.getFullYear();
-  const m     = now.getMonth();
+  const base  = new Date(now.getFullYear(), now.getMonth() + _calOffset, 1);
+  const y     = base.getFullYear();
+  const m     = base.getMonth();
   const first = new Date(y, m, 1).getDay();
   const days  = new Date(y, m + 1, 0).getDate();
   const dlMap = {};
@@ -782,18 +792,23 @@ function miniCalendar(deadlines) {
   for (let d = 1; d <= days; d++) {
     const ds  = `${y}-${String(m+1).padStart(2,'0')}-${String(d).padStart(2,'0')}`;
     const dl  = dlMap[ds];
-    const tod = d === now.getDate();
+    const tod = _calOffset === 0 && d === now.getDate();
+    const dotClass = dl ? (dl.isFinal ? 'cal-dot-final' : `cal-dot-${dl.type}`) : '';
     cells += `
       <div class="cal-cell ${tod ? 'cal-today' : ''} ${dl ? 'cal-has-deadline' : ''}">
         <span class="cal-day">${d}</span>
-        ${dl ? `<span class="cal-dot cal-dot-${dl.type}"></span>` : ''}
+        ${dl ? `<span class="cal-dot ${dotClass}"></span>` : ''}
       </div>`;
   }
 
-  const monthLabel = now.toLocaleDateString('en-US', { month: 'long', year: 'numeric' });
+  const monthLabel = base.toLocaleDateString('en-US', { month: 'long', year: 'numeric' });
   return `
     <div class="card calendar-card">
-      <div class="calendar-header">${monthLabel}</div>
+      <div class="calendar-header">
+        <button class="cal-nav" onclick="calNav(-1)">&#8249;</button>
+        <span>${monthLabel}</span>
+        <button class="cal-nav" onclick="calNav(1)">&#8250;</button>
+      </div>
       <div class="cal-grid">
         ${['Su','Mo','Tu','We','Th','Fr','Sa'].map(d => `<div class="cal-cell cal-header">${d}</div>`).join('')}
         ${cells}
@@ -801,8 +816,20 @@ function miniCalendar(deadlines) {
       <div class="cal-legend">
         <span class="cal-legend-item"><span class="cal-dot cal-dot-chapter"></span> End of chapter</span>
         <span class="cal-legend-item"><span class="cal-dot cal-dot-page"></span> Page stop</span>
+        <span class="cal-legend-item"><span class="cal-dot cal-dot-final"></span> Final</span>
       </div>
     </div>`;
+}
+
+function calNav(dir) {
+  _calOffset += dir;
+  const book      = DB.getActiveBook();
+  const deadlines = DB.getDeadlines().filter(d => d.bookId === book?.id);
+  const cal       = document.querySelector('.calendar-card');
+  if (cal) cal.outerHTML = miniCalendar(deadlines);
+  // outerHTML replacement doesn't work in-place; re-render the whole calendar container
+  const container = document.querySelector('.deadlines-layout > div:first-child');
+  if (container) container.innerHTML = miniCalendar(deadlines);
 }
 
 function confirmDeleteDeadline(id) {
@@ -812,27 +839,31 @@ function confirmDeleteDeadline(id) {
 // ============================================================
 // PAGE: ADD DEADLINE
 // ============================================================
-function pageAddDeadline() {
+function pageAddDeadline(existing) {
   const book  = DB.getActiveBook();
-  const week  = DB.getDeadlines().filter(d => d.bookId === book?.id).length + 1;
+  const allDl = DB.getDeadlines().filter(d => d.bookId === book?.id);
+  const week  = existing ? allDl.findIndex(d => d.id === existing.id) + 1 : allDl.length + 1;
+  const isEdit = !!existing;
+  const isChapter = !existing || existing.type === 'chapter';
 
   return `
     <div class="page">
       <div class="page-header">
         <div>
-          <h1 class="page-title">Add Deadline</h1>
+          <h1 class="page-title">${isEdit ? 'Edit Deadline' : 'Add Deadline'}</h1>
           <p class="page-subtitle">${book?.title || ''} · Week ${week}</p>
         </div>
         <a href="#/deadlines" class="btn btn-ghost">← Back</a>
       </div>
       <div class="card form-card">
         <form onsubmit="saveDeadline(event)">
+          ${isEdit ? `<input type="hidden" name="id" value="${existing.id}">` : ''}
 
           <div class="form-group">
             <label class="form-label">Deadline Type *</label>
             <div class="type-toggle">
               <label class="type-option">
-                <input type="radio" name="type" value="chapter" checked onchange="onTypeChange(this)">
+                <input type="radio" name="type" value="chapter" ${isChapter ? 'checked' : ''} onchange="onTypeChange(this)">
                 <span class="type-option-inner">
                   <span class="type-icon">📖</span>
                   <span class="type-label">End of Chapter</span>
@@ -840,7 +871,7 @@ function pageAddDeadline() {
                 </span>
               </label>
               <label class="type-option">
-                <input type="radio" name="type" value="page" onchange="onTypeChange(this)">
+                <input type="radio" name="type" value="page" ${!isChapter ? 'checked' : ''} onchange="onTypeChange(this)">
                 <span class="type-option-inner">
                   <span class="type-icon">🔖</span>
                   <span class="type-label">Page Stop</span>
@@ -850,31 +881,39 @@ function pageAddDeadline() {
             </div>
           </div>
 
-          <div id="chapter-field" class="form-group">
+          <div id="chapter-field" class="form-group" ${!isChapter ? 'style="display:none"' : ''}>
             <label class="form-label">Chapter Number *</label>
-            <input id="chapter-num" type="number" name="chapterNum" class="form-input" min="1" placeholder="e.g. 5">
+            <input id="chapter-num" type="number" name="chapterNum" class="form-input" min="1" placeholder="e.g. 5" ${!isChapter ? '' : 'required'} value="${existing?.chapterNum ?? ''}">
           </div>
 
           <div class="form-group">
             <label class="form-label">Through Page *</label>
             <p class="form-hint">The last page to be read by this deadline</p>
-            <input type="number" name="pageNum" class="form-input" required min="1" max="${book?.totalPages || 9999}" placeholder="e.g. 87">
+            <input type="number" name="pageNum" class="form-input" required min="1" max="${book?.totalPages || 9999}" placeholder="e.g. 87" value="${existing?.pageNum ?? ''}">
           </div>
 
           <div class="form-group">
             <label class="form-label">Custom Label <span class="form-optional">(optional)</span></label>
             <p class="form-hint">Leave blank to auto-generate, e.g. "End of Chapter 5" or "Page 87"</p>
-            <input type="text" name="customLabel" class="form-input" placeholder="e.g. Through the dream sequence">
+            <input type="text" name="customLabel" class="form-input" placeholder="e.g. Through the dream sequence" value="${existing?.label ?? ''}">
           </div>
 
           <div class="form-group">
             <label class="form-label">Due Date *</label>
-            <input type="date" name="date" class="form-input" required>
+            <input type="date" name="date" class="form-input" required value="${existing?.date ?? ''}">
+          </div>
+
+          <div class="form-group">
+            <label class="form-label checkbox-label">
+              <input type="checkbox" name="isFinal" value="1" ${existing?.isFinal ? 'checked' : ''}>
+              <span>Final deadline — end of book</span>
+            </label>
+            <p class="form-hint">Mark this as the last reading deadline for this book.</p>
           </div>
 
           <div class="form-actions">
             <a href="#/deadlines" class="btn btn-ghost">Cancel</a>
-            <button type="submit" class="btn btn-primary">Add Deadline</button>
+            <button type="submit" class="btn btn-primary">${isEdit ? 'Save Changes' : 'Add Deadline'}</button>
           </div>
         </form>
       </div>
@@ -890,7 +929,6 @@ function onTypeChange(radio) {
   } else {
     field.style.display = 'none';
     input.required = false;
-    input.value = '';
   }
 }
 
@@ -898,13 +936,21 @@ function saveDeadline(e) {
   e.preventDefault();
   const book = DB.getActiveBook();
   if (!book) return;
-  const d     = Object.fromEntries(new FormData(e.target));
-  const type  = d.type;
-  const page  = parseInt(d.pageNum);
-  const ch    = d.chapterNum ? parseInt(d.chapterNum) : null;
-  const label = d.customLabel?.trim() || (type === 'chapter' && ch ? `End of Chapter ${ch}` : `Page ${page}`);
+  const d       = Object.fromEntries(new FormData(e.target));
+  const type    = d.type;
+  const page    = parseInt(d.pageNum);
+  const ch      = d.chapterNum ? parseInt(d.chapterNum) : null;
+  const label   = d.customLabel?.trim() || (type === 'chapter' && ch ? `End of Chapter ${ch}` : `Page ${page}`);
+  const isFinal = d.isFinal === '1';
 
-  DB.saveDeadline({ id: uid(), bookId: book.id, type, label, chapterNum: ch, pageNum: page, date: d.date, createdAt: new Date().toISOString() });
+  const existing = d.id ? DB.getDeadlines().find(x => x.id === d.id) : null;
+  DB.saveDeadline({
+    id: existing?.id || uid(),
+    bookId: book.id,
+    type, label, chapterNum: ch, pageNum: page, date: d.date,
+    isFinal,
+    createdAt: existing?.createdAt || new Date().toISOString(),
+  });
   navigate('/deadlines');
 }
 
