@@ -554,7 +554,7 @@ function cancelPageEdit() {
 function savePageEdit() {
   const input = document.getElementById('inline-page-input');
   const page  = parseInt(input?.value);
-  if (!page || page < 1) { cancelPageEdit(); return; }
+  if (isNaN(page) || page < 0) { cancelPageEdit(); return; }
   DB.updateProgress(DB.getUser(), page);
   handleRoute();
 }
