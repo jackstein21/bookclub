@@ -142,7 +142,7 @@ const DB = {
     if (!book) return;
     const { error: uErr } = await sb.from('progress').upsert({
       account_id: State.account.id, book_id: book.id,
-      current_page: page, updated_at: new Date().toISOString(),
+      current_page: page,
     }, { onConflict: 'account_id,book_id' });
     if (uErr) throw uErr;
     const { error: hErr } = await sb.from('progress_history').insert({
