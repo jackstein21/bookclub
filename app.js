@@ -1,167 +1,199 @@
 // ============================================================
-// BOOKCLUB
+// BOOKCLUB — Supabase Edition
 // ============================================================
 
 // ============================================================
-// STORAGE
+// CONFIG
 // ============================================================
-const DB = {
-  _get: (k) => { try { return JSON.parse(localStorage.getItem('bc_' + k)); } catch { return null; } },
-  _set: (k, v) => localStorage.setItem('bc_' + k, JSON.stringify(v)),
+const SUPABASE_URL      = 'https://bgafaiybnrrbpfxewppx.supabase.co';
+const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImJnYWZhaXlibnJyYnBmeGV3cHB4Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzg4Nzg5NDYsImV4cCI6MjA5NDQ1NDk0Nn0.ZO62xgyU47oThk4G0LPRq11i6Q-yB7X0OUjRRcJKcw0';
+const CLUB_ID           = 'a1b2c3d4-e5f6-7890-abcd-ef1234567890';
 
-  getUser:    ()  => DB._get('user'),
-  setUser:    (u) => DB._set('user', u),
+const sb = supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 
-  getBooks:   ()  => DB._get('books') || [],
-  saveBook:   (b) => {
-    const arr = DB.getBooks();
-    const i = arr.findIndex(x => x.id === b.id);
-    i >= 0 ? arr[i] = b : arr.push(b);
-    DB._set('books', arr);
-    Sync.push();
-  },
-  deleteBook: (id) => { DB._set('books', DB.getBooks().filter(b => b.id !== id)); Sync.push(); },
-  getActiveBook: () => {
-    const books = DB.getBooks();
-    return books.find(b => b.isActive) || books[0] || null;
-  },
-  setActiveBook: (id) => {
-    DB._set('books', DB.getBooks().map(b => ({ ...b, isActive: b.id === id })));
-    Sync.push();
-  },
-
-  getDeadlines: () => (DB._get('deadlines') || []).sort((a, b) => new Date(a.date) - new Date(b.date)),
-  saveDeadline: (d) => {
-    const arr = DB._get('deadlines') || [];
-    const i = arr.findIndex(x => x.id === d.id);
-    i >= 0 ? arr[i] = d : arr.push(d);
-    DB._set('deadlines', arr);
-    Sync.push();
-  },
-  deleteDeadline: (id) => { DB._set('deadlines', (DB._get('deadlines') || []).filter(d => d.id !== id)); Sync.push(); },
-
-  getProgress: ()  => DB._get('progress') || { jack: null, jordan: null },
-  updateProgress: (user, page) => {
-    const p = DB.getProgress();
-    if (!p[user]) p[user] = { history: [] };
-    p[user].currentPage = page;
-    p[user].updatedAt   = new Date().toISOString();
-    if (!p[user].history) p[user].history = [];
-    p[user].history.push({ page, date: new Date().toISOString() });
-    DB._set('progress', p);
-    Sync.push();
-  },
-
-  getQuestions: ()     => DB._get('questions') || [],
-  getQuestion:  (wid)  => (DB._get('questions') || []).find(q => q.weekId === wid) || null,
-  saveQuestion: (q) => {
-    const arr = DB._get('questions') || [];
-    const i = arr.findIndex(x => x.weekId === q.weekId);
-    i >= 0 ? arr[i] = q : arr.push(q);
-    DB._set('questions', arr);
-    Sync.push();
-  },
-
-  getNotes:   ()  => (DB._get('notes') || []).sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt)),
-  saveNote:   (n) => {
-    const arr = DB._get('notes') || [];
-    arr.push(n);
-    DB._set('notes', arr);
-    Sync.push();
-  },
-  deleteNote: (id) => {
-    DB._set('notes', (DB._get('notes') || []).filter(n => n.id !== id));
-    Sync.push();
-  },
+// ============================================================
+// STATE — in-memory cache, loaded from Supabase on login
+// ============================================================
+const State = {
+  account:   null,  // { id, username, club_id }
+  books:     [],
+  deadlines: [],
+  progress:  {},    // { jack: { currentPage, updatedAt, history: [] }, jordan: {...} }
+  questions: [],
+  notes:     [],    // each note: { id, bookId, author (username), accountId, text, page, createdAt }
 };
 
 // ============================================================
-// SYNC — Cloudflare Workers backend
-//
-// How it fits together:
-//   DB.*  → always reads/writes localStorage immediately (instant, works offline)
-//   Sync.push() → after every write, sends the full state to the Worker async
-//   Sync.pull() → on page load, fetches remote state and overwrites localStorage
-//
-// This means: open the app on your phone → pull latest → make changes → push.
-// Open on laptop → pull → see phone's changes. The remote is the single source
-// of truth; localStorage is just a fast local cache.
-//
-// SETUP (run once after deploying the Worker):
-//   1. Copy config.example.js → config.js (gitignored)
-//   2. Fill in BOOKCLUB_API_URL and BOOKCLUB_APP_KEY in config.js
+// DATA LOADING
 // ============================================================
-const API_URL = window.BOOKCLUB_API_URL || '';
-const APP_KEY = window.BOOKCLUB_APP_KEY || '';
+async function loadData() {
+  if (!State.account) return;
 
-const Sync = {
-  // Pull remote state into localStorage. Called once on page load.
-  // Remote always wins — this is how Jordan's changes appear on Jack's device.
-  async pull() {
-    if (!this._configured()) return;
-    try {
-      const res = await fetch(`${API_URL}/api/data`, {
-        headers: { 'X-App-Key': APP_KEY },
-      });
-      if (res.status === 429) { this._limitBanner(await res.json()); return; }
-      if (!res.ok) return;
-      const data = await res.json();
-      // Only overwrite keys that exist in the remote payload
-      ['books', 'deadlines', 'progress', 'questions', 'notes'].forEach(k => {
-        if (data[k] !== undefined) DB._set(k, data[k]);
-      });
-    } catch {
-      // Network unavailable — silently fall back to cached localStorage data
-    }
+  const [booksRes, deadlinesRes, progressRes, historyRes, questionsRes, notesRes, accountsRes] =
+    await Promise.all([
+      sb.from('books').select('*').eq('club_id', State.account.club_id).order('created_at'),
+      sb.from('deadlines').select('*').order('date'),
+      sb.from('progress').select('*'),
+      sb.from('progress_history').select('*').order('recorded_at', { ascending: false }),
+      sb.from('questions').select('*'),
+      sb.from('notes').select('*').order('created_at', { ascending: false }),
+      sb.from('accounts').select('id, username').eq('club_id', State.account.club_id),
+    ]);
+
+  const accountMap = {};
+  (accountsRes.data || []).forEach(a => { accountMap[a.id] = a.username; });
+
+  State.books = (booksRes.data || []).map(b => ({
+    id: b.id, title: b.title, author: b.author,
+    totalPages: b.total_pages, color: b.color || '#2D5A27',
+    isActive: b.is_active, createdAt: b.created_at,
+  }));
+
+  State.deadlines = (deadlinesRes.data || []).map(d => ({
+    id: d.id, bookId: d.book_id, type: d.type, label: d.label,
+    chapterNum: d.chapter_num, pageNum: d.page_num, date: d.date,
+    isFinal: d.is_final, createdAt: d.created_at,
+  }));
+
+  State.progress = {};
+  (progressRes.data || []).forEach(p => {
+    const username = accountMap[p.account_id];
+    if (username) State.progress[username] = { currentPage: p.current_page, updatedAt: p.updated_at, history: [] };
+  });
+  (historyRes.data || []).forEach(h => {
+    const username = accountMap[h.account_id];
+    if (username && State.progress[username])
+      State.progress[username].history.push({ page: h.page, date: h.recorded_at });
+  });
+
+  State.questions = (questionsRes.data || []).map(q => ({
+    weekId: q.week_id, bookId: q.book_id,
+    jackWroteForJordan: q.jack_wrote_for_jordan,
+    jordanWroteForJack: q.jordan_wrote_for_jack,
+    answers: q.answers || { jack: {}, jordan: {} },
+  }));
+
+  State.notes = (notesRes.data || []).map(n => ({
+    id: n.id, bookId: n.book_id,
+    author: accountMap[n.account_id] || '?',
+    accountId: n.account_id,
+    text: n.content, page: n.page, createdAt: n.created_at,
+  }));
+}
+
+// ============================================================
+// DB — reads State (sync), writes Supabase + State (async)
+// ============================================================
+const DB = {
+  getUser:      () => State.account?.username || null,
+  getBooks:     () => State.books,
+  getActiveBook: () => State.books.find(b => b.isActive) || State.books[0] || null,
+
+  saveBook: async (b) => {
+    const { error } = await sb.from('books').upsert({
+      id: b.id, club_id: State.account.club_id,
+      title: b.title, author: b.author, total_pages: b.totalPages,
+      color: b.color, is_active: b.isActive,
+    });
+    if (error) throw error;
+    const i = State.books.findIndex(x => x.id === b.id);
+    i >= 0 ? State.books[i] = b : State.books.push(b);
+    if (b.isActive) State.books.forEach(x => { if (x.id !== b.id) x.isActive = false; });
   },
 
-  // Push the full local state to remote. Fire-and-forget after every DB write.
-  // Using one blob keeps KV writes minimal (1 write per save, not one per record).
-  async push() {
-    if (!this._configured()) return;
-    try {
-      const res = await fetch(`${API_URL}/api/data`, {
-        method:  'POST',
-        headers: { 'Content-Type': 'application/json', 'X-App-Key': APP_KEY },
-        body:    JSON.stringify({
-          books:     DB._get('books')     || [],
-          deadlines: DB._get('deadlines') || [],
-          progress:  DB._get('progress')  || {},
-          questions: DB._get('questions') || [],
-          notes:     DB._get('notes')     || [],
-        }),
-      });
-      if (res.status === 429) { this._limitBanner(await res.json()); }
-    } catch {
-      // Silently fail — data is safe in localStorage, will sync next time
-    }
+  setActiveBook: async (id) => {
+    await sb.from('books').update({ is_active: false }).eq('club_id', State.account.club_id);
+    await sb.from('books').update({ is_active: true }).eq('id', id);
+    State.books.forEach(b => { b.isActive = b.id === id; });
   },
 
-  _configured() {
-    return API_URL !== 'REPLACE_WITH_WORKER_URL' && APP_KEY !== 'REPLACE_WITH_APP_KEY';
+  deleteBook: async (id) => {
+    const { error } = await sb.from('books').delete().eq('id', id);
+    if (error) throw error;
+    State.books     = State.books.filter(b => b.id !== id);
+    State.deadlines = State.deadlines.filter(d => d.bookId !== id);
+    State.questions = State.questions.filter(q => q.bookId !== id);
+    State.notes     = State.notes.filter(n => n.bookId !== id);
   },
 
-  // Show a dismissible banner when the 90k daily limit is hit.
-  // The app still works read-only via localStorage until midnight UTC resets the counter.
-  _limitBanner(data) {
-    if (document.getElementById('rate-limit-banner')) return;
-    const el = document.createElement('div');
-    el.id = 'rate-limit-banner';
-    el.className = 'rate-limit-banner';
-    el.innerHTML = `
-      <span>⚠️ Daily sync limit reached (${(data.limit || 90000).toLocaleString()} requests/day).
-      The app is read-only until midnight UTC — your local data is safe.</span>
-      <button onclick="this.parentElement.remove()">Dismiss</button>
-    `;
-    document.body.prepend(el);
+  getDeadlines: () => [...State.deadlines].sort((a, b) => new Date(a.date) - new Date(b.date)),
+
+  saveDeadline: async (d) => {
+    const { error } = await sb.from('deadlines').upsert({
+      id: d.id, book_id: d.bookId, type: d.type, label: d.label,
+      chapter_num: d.chapterNum, page_num: d.pageNum, date: d.date, is_final: d.isFinal,
+    });
+    if (error) throw error;
+    const i = State.deadlines.findIndex(x => x.id === d.id);
+    i >= 0 ? State.deadlines[i] = d : State.deadlines.push(d);
+  },
+
+  deleteDeadline: async (id) => {
+    const { error } = await sb.from('deadlines').delete().eq('id', id);
+    if (error) throw error;
+    State.deadlines = State.deadlines.filter(d => d.id !== id);
+    State.questions = State.questions.filter(q => q.weekId !== id);
+  },
+
+  getProgress: () => State.progress,
+
+  updateProgress: async (username, page) => {
+    const book = DB.getActiveBook();
+    if (!book) return;
+    const { error: uErr } = await sb.from('progress').upsert({
+      account_id: State.account.id, book_id: book.id,
+      current_page: page, updated_at: new Date().toISOString(),
+    }, { onConflict: 'account_id,book_id' });
+    if (uErr) throw uErr;
+    const { error: hErr } = await sb.from('progress_history').insert({
+      account_id: State.account.id, book_id: book.id, page,
+    });
+    if (hErr) throw hErr;
+    if (!State.progress[username]) State.progress[username] = { history: [] };
+    State.progress[username].currentPage = page;
+    State.progress[username].updatedAt   = new Date().toISOString();
+    State.progress[username].history     = [
+      { page, date: new Date().toISOString() },
+      ...(State.progress[username].history || []),
+    ];
+  },
+
+  getQuestions: () => State.questions,
+  getQuestion:  (wid) => State.questions.find(q => q.weekId === wid) || null,
+
+  saveQuestion: async (q) => {
+    const { error } = await sb.from('questions').upsert({
+      week_id: q.weekId, book_id: q.bookId,
+      jack_wrote_for_jordan: q.jackWroteForJordan,
+      jordan_wrote_for_jack: q.jordanWroteForJack,
+      answers: q.answers,
+    }, { onConflict: 'week_id' });
+    if (error) throw error;
+    const i = State.questions.findIndex(x => x.weekId === q.weekId);
+    i >= 0 ? State.questions[i] = q : State.questions.push(q);
+  },
+
+  getNotes: () => State.notes,
+
+  saveNote: async (n) => {
+    const { error } = await sb.from('notes').insert({
+      id: n.id, book_id: n.bookId, account_id: State.account.id,
+      content: n.text, page: n.page,
+    });
+    if (error) throw error;
+    State.notes.unshift(n);
+  },
+
+  deleteNote: async (id) => {
+    const { error } = await sb.from('notes').delete().eq('id', id);
+    if (error) throw error;
+    State.notes = State.notes.filter(n => n.id !== id);
   },
 };
 
 // ============================================================
 // UTILS
 // ============================================================
-const uid = () => Math.random().toString(36).slice(2, 10);
-
 function cap(s) { return s ? s.charAt(0).toUpperCase() + s.slice(1) : ''; }
 function other(user) { return user === 'jack' ? 'jordan' : 'jack'; }
 
@@ -177,7 +209,7 @@ function daysUntil(str) {
   return Math.ceil((target - today) / 86400000);
 }
 
-function isPast(str) { return daysUntil(str) < 0; }
+function isPast(str)     { return daysUntil(str) < 0; }
 function isUpcoming(str) { return daysUntil(str) > 0; }
 
 function timeOfDay() {
@@ -185,7 +217,6 @@ function timeOfDay() {
   return h < 12 ? 'morning' : h < 17 ? 'afternoon' : 'evening';
 }
 
-// Weeks are derived from sorted deadlines for a book
 function getWeeks(bookId) {
   return DB.getDeadlines()
     .filter(d => d.bookId === bookId)
@@ -218,9 +249,10 @@ function daysChip(days) {
 function getHash() { return window.location.hash.slice(1) || '/'; }
 function navigate(path) { window.location.hash = path; }
 
-function handleRoute() {
-  const user = DB.getUser();
-  if (!user) { renderFull(pageUserSelect()); return; }
+async function handleRoute() {
+  if (!State.account) { renderFull(pageLogin()); return; }
+
+  await loadData();
 
   const hash  = getHash();
   const parts = hash.split('/').filter(Boolean);
@@ -252,11 +284,9 @@ function renderFull(html) {
 }
 
 function renderWithShell(content) {
-  const user  = DB.getUser();
-  const hash  = getHash();
+  const user = DB.getUser();
+  const hash = getHash();
 
-  // Desktop sidebar shows all pages. Mobile bottom nav shows the 5 most-used
-  // (Books is accessed via Dashboard → Manage Books on mobile).
   const allNavItems = [
     { href: '/',          icon: icons.grid,     label: 'Home',      mobile: true,  match: () => hash === '/' || hash === '' },
     { href: '/books',     icon: icons.book,     label: 'Books',     mobile: false, match: () => hash.startsWith('/books') },
@@ -277,16 +307,12 @@ function renderWithShell(content) {
 
   document.getElementById('app').innerHTML = `
     <div class="layout">
-
-      <!-- Mobile-only top bar -->
       <header class="mobile-header">
         <div class="mobile-header-logo">${icons.mountain}<span>BookClub</span></div>
-        <button class="mobile-user-btn" onclick="switchUser()" title="Switch user">
+        <button class="mobile-user-btn" onclick="switchUser()" title="Sign out">
           <div class="user-avatar">${cap(user).charAt(0)}</div>
         </button>
       </header>
-
-      <!-- Desktop sidebar -->
       <nav class="sidebar">
         <div class="sidebar-header">
           <div class="logo">${icons.mountain}<span>BookClub</span></div>
@@ -296,16 +322,12 @@ function renderWithShell(content) {
           <div class="user-pill">
             <div class="user-avatar">${cap(user).charAt(0)}</div>
             <span>${cap(user)}</span>
-            <button class="switch-user-btn" onclick="switchUser()">Switch</button>
+            <button class="switch-user-btn" onclick="switchUser()">Sign out</button>
           </div>
         </div>
       </nav>
-
       <main class="main-content">${content}</main>
-
-      <!-- Mobile-only bottom nav (Books excluded — access via Dashboard) -->
       <nav class="bottom-nav">${mobileNavLinks}</nav>
-
     </div>
   `;
 }
@@ -325,33 +347,170 @@ const icons = {
 };
 
 // ============================================================
-// PAGE: USER SELECT
+// PAGE: LOGIN
 // ============================================================
-function pageUserSelect() {
+function pageLogin(mode = 'login') {
+  const isSignup = mode === 'signup';
   return `
     <div class="user-select-page">
       <div class="user-select-inner">
         <div class="user-select-logo">${icons.mountain}</div>
         <h1>BookClub</h1>
-        <p class="user-select-subtitle">Jack & Jordan · Breckenridge, CO</p>
-        <p class="user-select-who">Who's reading?</p>
-        <div class="user-cards">
-          <button class="user-card" onclick="selectUser('jack')">
-            <div class="user-card-avatar jack">J</div>
-            <div class="user-card-name">Jack</div>
-          </button>
-          <button class="user-card" onclick="selectUser('jordan')">
-            <div class="user-card-avatar jordan">J</div>
-            <div class="user-card-name">Jordan</div>
-          </button>
-        </div>
+        <p class="user-select-subtitle">Jack &amp; Jordan · Breckenridge, CO</p>
+
+        ${isSignup ? `
+          <form class="auth-form" onsubmit="handleSignup(event)">
+            <div class="form-group">
+              <input type="email" name="email" class="form-input" placeholder="Email" required autocomplete="email">
+            </div>
+            <div class="form-group">
+              <input type="password" name="password" class="form-input" placeholder="Password (min 6 chars)" minlength="6" required autocomplete="new-password">
+            </div>
+            <div class="form-group">
+              <p class="form-label" style="margin-bottom:10px">Who are you?</p>
+              <div class="user-cards">
+                <label class="user-card-radio">
+                  <input type="radio" name="username" value="jack" required>
+                  <span class="user-card">
+                    <div class="user-card-avatar jack">J</div>
+                    <div class="user-card-name">Jack</div>
+                  </span>
+                </label>
+                <label class="user-card-radio">
+                  <input type="radio" name="username" value="jordan" required>
+                  <span class="user-card">
+                    <div class="user-card-avatar jordan">J</div>
+                    <div class="user-card-name">Jordan</div>
+                  </span>
+                </label>
+              </div>
+            </div>
+            <div id="auth-error" class="auth-error"></div>
+            <button type="submit" class="btn btn-primary auth-btn">Create Account</button>
+            <p class="auth-switch">Already have an account? <a href="#" onclick="showLogin(event)">Sign in</a></p>
+          </form>
+        ` : `
+          <form class="auth-form" onsubmit="handleLogin(event)">
+            <div class="form-group">
+              <input type="email" name="email" class="form-input" placeholder="Email" required autocomplete="email">
+            </div>
+            <div class="form-group">
+              <input type="password" name="password" class="form-input" placeholder="Password" required autocomplete="current-password">
+            </div>
+            <div id="auth-error" class="auth-error"></div>
+            <button type="submit" class="btn btn-primary auth-btn">Sign In</button>
+            <p class="auth-switch">No account yet? <a href="#" onclick="showSignup(event)">Sign up</a></p>
+          </form>
+        `}
       </div>
     </div>
   `;
 }
 
-function selectUser(user) { DB.setUser(user); navigate('/'); }
-function switchUser()      { DB.setUser(null); renderFull(pageUserSelect()); }
+// Shown when a session exists but no accounts row yet (edge case: email confirmed after failed insert)
+function pageCompleteProfile() {
+  return `
+    <div class="user-select-page">
+      <div class="user-select-inner">
+        <div class="user-select-logo">${icons.mountain}</div>
+        <h1>BookClub</h1>
+        <p class="user-select-subtitle">One more step — who are you?</p>
+        <form class="auth-form" onsubmit="handleCompleteProfile(event)">
+          <div class="form-group">
+            <div class="user-cards">
+              <label class="user-card-radio">
+                <input type="radio" name="username" value="jack" required>
+                <span class="user-card">
+                  <div class="user-card-avatar jack">J</div>
+                  <div class="user-card-name">Jack</div>
+                </span>
+              </label>
+              <label class="user-card-radio">
+                <input type="radio" name="username" value="jordan" required>
+                <span class="user-card">
+                  <div class="user-card-avatar jordan">J</div>
+                  <div class="user-card-name">Jordan</div>
+                </span>
+              </label>
+            </div>
+          </div>
+          <div id="auth-error" class="auth-error"></div>
+          <button type="submit" class="btn btn-primary auth-btn">Continue</button>
+        </form>
+      </div>
+    </div>
+  `;
+}
+
+function showLogin(e)  { e.preventDefault(); renderFull(pageLogin('login')); }
+function showSignup(e) { e.preventDefault(); renderFull(pageLogin('signup')); }
+
+async function handleLogin(e) {
+  e.preventDefault();
+  const { email, password } = Object.fromEntries(new FormData(e.target));
+  const btn = e.target.querySelector('button[type=submit]');
+  btn.disabled = true; btn.textContent = 'Signing in…';
+
+  const { error } = await sb.auth.signInWithPassword({ email, password });
+  if (error) {
+    document.getElementById('auth-error').textContent = error.message;
+    btn.disabled = false; btn.textContent = 'Sign In';
+    return;
+  }
+  await initApp();
+}
+
+async function handleSignup(e) {
+  e.preventDefault();
+  const { email, password, username } = Object.fromEntries(new FormData(e.target));
+  const btn = e.target.querySelector('button[type=submit]');
+  btn.disabled = true; btn.textContent = 'Creating account…';
+
+  const { data, error } = await sb.auth.signUp({ email, password });
+  if (error) {
+    document.getElementById('auth-error').textContent = error.message;
+    btn.disabled = false; btn.textContent = 'Create Account';
+    return;
+  }
+
+  if (!data.session) {
+    // Email confirmation required — unlikely if disabled in Supabase dashboard
+    document.getElementById('auth-error').textContent = 'Check your email to confirm your account, then sign in.';
+    btn.disabled = false; btn.textContent = 'Create Account';
+    return;
+  }
+
+  const { error: accErr } = await sb.from('accounts').insert({ id: data.user.id, username, club_id: CLUB_ID });
+  if (accErr) {
+    document.getElementById('auth-error').textContent = accErr.message;
+    btn.disabled = false; btn.textContent = 'Create Account';
+    return;
+  }
+
+  await initApp();
+}
+
+async function handleCompleteProfile(e) {
+  e.preventDefault();
+  const { username } = Object.fromEntries(new FormData(e.target));
+  const { data: { user } } = await sb.auth.getUser();
+  const btn = e.target.querySelector('button[type=submit]');
+  btn.disabled = true; btn.textContent = 'Saving…';
+
+  const { error } = await sb.from('accounts').insert({ id: user.id, username, club_id: CLUB_ID });
+  if (error) {
+    document.getElementById('auth-error').textContent = error.message;
+    btn.disabled = false; btn.textContent = 'Continue';
+    return;
+  }
+  await initApp();
+}
+
+async function switchUser() {
+  await sb.auth.signOut();
+  State.account = null;
+  renderFull(pageLogin('login'));
+}
 
 // ============================================================
 // PAGE: DASHBOARD
@@ -377,19 +536,16 @@ function pageDashboard() {
   const nextDeadline = deadlines.find(d => !isPast(d.date));
   const weeks        = getWeeks(book.id);
 
-  // Questions needing answers (deadline passed, not yet submitted)
   const pendingWeeks = weeks.filter(w => {
     if (isUpcoming(w.deadline.date)) return false;
     const q = DB.getQuestion(w.weekId);
     return !q?.answers?.[user]?.submittedAt;
   });
 
-  // Upcoming week where I haven't written my custom question yet
   const nextWeek = weeks.find(w => isUpcoming(w.deadline.date));
   const nextQ    = nextWeek ? DB.getQuestion(nextWeek.weekId) : null;
   const wroteQ   = nextQ ? !!(user === 'jack' ? nextQ.jackWroteForJordan : nextQ.jordanWroteForJack) : true;
 
-  // Progress calculations
   const pctToDeadline = (myProg?.currentPage && nextDeadline)
     ? Math.min(100, Math.round(myProg.currentPage / nextDeadline.pageNum * 100))
     : 0;
@@ -404,14 +560,14 @@ function pageDashboard() {
     : book.totalPages;
 
   function motivationLine(pct) {
-    if (pct === 0)   return 'Ready to dive in?';
-    if (pct < 10)    return 'Every page counts — keep going.';
-    if (pct < 25)    return 'Good start. Build the habit.';
-    if (pct < 50)    return 'Finding your rhythm — stay with it.';
-    if (pct === 50)  return 'Halfway there. Don\'t stop now.';
-    if (pct < 75)    return 'Past the halfway point — momentum is everything.';
-    if (pct < 90)    return 'The end is in sight. Finish strong.';
-    if (pct < 100)   return 'Almost done. See it through.';
+    if (pct === 0)  return 'Ready to dive in?';
+    if (pct < 10)   return 'Every page counts — keep going.';
+    if (pct < 25)   return 'Good start. Build the habit.';
+    if (pct < 50)   return 'Finding your rhythm — stay with it.';
+    if (pct === 50) return "Halfway there. Don't stop now.";
+    if (pct < 75)   return 'Past the halfway point — momentum is everything.';
+    if (pct < 90)   return 'The end is in sight. Finish strong.';
+    if (pct < 100)  return 'Almost done. See it through.';
     return 'Finished! Time to discuss.';
   }
 
@@ -426,7 +582,6 @@ function pageDashboard() {
 
       <div class="dashboard-grid">
 
-        <!-- Combined book + progress card (full width) -->
         <div class="card reading-progress-card">
           <div class="reading-progress-inner">
             <div class="reading-info">
@@ -501,7 +656,6 @@ function pageDashboard() {
           </div>
         </div>
 
-        <!-- Deadline card -->
         <div class="card questions-card">
           <div class="card-label">Questions</div>
           ${pendingWeeks.length > 0 ? `
@@ -524,7 +678,6 @@ function pageDashboard() {
           <a href="#/questions" class="btn btn-secondary mt-3">View All Weeks</a>
         </div>
 
-        <!-- Quick links card -->
         <div class="card" style="display:flex;flex-direction:column;gap:8px;justify-content:center">
           <div class="card-label">Jump To</div>
           <a href="#/deadlines/add" class="btn btn-secondary" style="justify-content:center">+ Add Deadline</a>
@@ -552,11 +705,11 @@ function cancelPageEdit() {
   document.getElementById('page-display')?.classList.remove('hidden');
 }
 
-function savePageEdit() {
+async function savePageEdit() {
   const input = document.getElementById('inline-page-input');
   const page  = parseInt(input?.value);
   if (isNaN(page) || page < 0) { cancelPageEdit(); return; }
-  DB.updateProgress(DB.getUser(), page);
+  await DB.updateProgress(DB.getUser(), page);
   handleRoute();
 }
 
@@ -587,11 +740,11 @@ function logModal(book, myProg) {
 function openLogModal()  { document.getElementById('log-modal')?.classList.remove('hidden'); document.getElementById('log-page-input')?.focus(); }
 function closeLogModal() { document.getElementById('log-modal')?.classList.add('hidden'); }
 
-function submitLogPages() {
+async function submitLogPages() {
   const input = document.getElementById('log-page-input');
   const page  = parseInt(input?.value);
   if (!page || page < 1) return;
-  DB.updateProgress(DB.getUser(), page);
+  await DB.updateProgress(DB.getUser(), page);
   closeLogModal();
   handleRoute();
 }
@@ -643,12 +796,14 @@ function pageBooks() {
     </div>`;
 }
 
-function setActiveBook(id)       { DB.setActiveBook(id); navigate('/books'); }
-function confirmDeleteBook(id)   {
+async function setActiveBook(id) {
+  await DB.setActiveBook(id);
+  navigate('/books');
+}
+
+async function confirmDeleteBook(id) {
   if (confirm('Delete this book? All deadlines and questions for it will also be removed.')) {
-    DB.deleteBook(id);
-    DB._set('deadlines', DB.getDeadlines().filter(d => d.bookId !== id));
-    DB._set('questions', DB.getQuestions().filter(q => q.bookId !== id));
+    await DB.deleteBook(id);
     navigate('/books');
   }
 }
@@ -699,23 +854,31 @@ function pageBookForm(book) {
     </div>`;
 }
 
-function saveBook(e, existingId) {
+async function saveBook(e, existingId) {
   e.preventDefault();
-  const d     = Object.fromEntries(new FormData(e.target));
-  const books = DB.getBooks();
+  const d       = Object.fromEntries(new FormData(e.target));
+  const books   = DB.getBooks();
   const isFirst = books.length === 0 && !existingId;
   const existing = existingId ? books.find(b => b.id === existingId) : null;
 
-  DB.saveBook({
-    id:         existingId || uid(),
-    title:      d.title.trim(),
-    author:     d.author.trim(),
-    totalPages: parseInt(d.totalPages),
-    color:      d.color || SPINE_COLORS[0],
-    isActive:   existing ? existing.isActive : isFirst,
-    createdAt:  existing?.createdAt || new Date().toISOString(),
-  });
-  navigate('/books');
+  const btn = e.target.querySelector('button[type=submit]');
+  btn.disabled = true;
+
+  try {
+    await DB.saveBook({
+      id:         existingId || crypto.randomUUID(),
+      title:      d.title.trim(),
+      author:     d.author.trim(),
+      totalPages: parseInt(d.totalPages),
+      color:      d.color || SPINE_COLORS[0],
+      isActive:   existing ? existing.isActive : isFirst,
+      createdAt:  existing?.createdAt || new Date().toISOString(),
+    });
+    navigate('/books');
+  } catch (err) {
+    alert('Failed to save book. Please try again.');
+    btn.disabled = false;
+  }
 }
 
 // ============================================================
@@ -825,15 +988,15 @@ function calNav(dir) {
   _calOffset += dir;
   const book      = DB.getActiveBook();
   const deadlines = DB.getDeadlines().filter(d => d.bookId === book?.id);
-  const cal       = document.querySelector('.calendar-card');
-  if (cal) cal.outerHTML = miniCalendar(deadlines);
-  // outerHTML replacement doesn't work in-place; re-render the whole calendar container
   const container = document.querySelector('.deadlines-layout > div:first-child');
   if (container) container.innerHTML = miniCalendar(deadlines);
 }
 
-function confirmDeleteDeadline(id) {
-  if (confirm('Delete this deadline?')) { DB.deleteDeadline(id); navigate('/deadlines'); }
+async function confirmDeleteDeadline(id) {
+  if (confirm('Delete this deadline?')) {
+    await DB.deleteDeadline(id);
+    navigate('/deadlines');
+  }
 }
 
 // ============================================================
@@ -843,7 +1006,7 @@ function pageAddDeadline(existing) {
   const book  = DB.getActiveBook();
   const allDl = DB.getDeadlines().filter(d => d.bookId === book?.id);
   const week  = existing ? allDl.findIndex(d => d.id === existing.id) + 1 : allDl.length + 1;
-  const isEdit = !!existing;
+  const isEdit    = !!existing;
   const isChapter = !existing || existing.type === 'chapter';
 
   return `
@@ -932,7 +1095,7 @@ function onTypeChange(radio) {
   }
 }
 
-function saveDeadline(e) {
+async function saveDeadline(e) {
   e.preventDefault();
   const book = DB.getActiveBook();
   if (!book) return;
@@ -943,15 +1106,23 @@ function saveDeadline(e) {
   const label   = d.customLabel?.trim() || (type === 'chapter' && ch ? `End of Chapter ${ch}` : `Page ${page}`);
   const isFinal = d.isFinal === '1';
 
-  const existing = d.id ? DB.getDeadlines().find(x => x.id === d.id) : null;
-  DB.saveDeadline({
-    id: existing?.id || uid(),
-    bookId: book.id,
-    type, label, chapterNum: ch, pageNum: page, date: d.date,
-    isFinal,
-    createdAt: existing?.createdAt || new Date().toISOString(),
-  });
-  navigate('/deadlines');
+  const btn = e.target.querySelector('button[type=submit]');
+  btn.disabled = true;
+
+  try {
+    const existing = d.id ? DB.getDeadlines().find(x => x.id === d.id) : null;
+    await DB.saveDeadline({
+      id: existing?.id || crypto.randomUUID(),
+      bookId: book.id,
+      type, label, chapterNum: ch, pageNum: page, date: d.date,
+      isFinal,
+      createdAt: existing?.createdAt || new Date().toISOString(),
+    });
+    navigate('/deadlines');
+  } catch (err) {
+    alert('Failed to save deadline. Please try again.');
+    btn.disabled = false;
+  }
 }
 
 // ============================================================
@@ -1118,9 +1289,9 @@ function pageQuestions() {
 // PAGE: WEEK QUESTIONS DETAIL
 // ============================================================
 function pageWeekQuestions(weekId) {
-  const book = DB.getActiveBook();
-  const user = DB.getUser();
-  const them = other(user);
+  const book  = DB.getActiveBook();
+  const user  = DB.getUser();
+  const them  = other(user);
   const weeks = book ? getWeeks(book.id) : [];
   const week  = weeks.find(w => w.weekId === weekId);
 
@@ -1136,7 +1307,6 @@ function pageWeekQuestions(weekId) {
   const jackQ     = q.jackWroteForJordan;
   const jordanQ   = q.jordanWroteForJack;
   const bothWrote = !!(jackQ && jordanQ);
-  // Only revealed once BOTH parties have submitted their custom question
   const questionForMe  = bothWrote ? (user === 'jack' ? jordanQ : jackQ) : null;
   const questionIWrote = user === 'jack' ? jackQ : jordanQ;
 
@@ -1278,7 +1448,7 @@ function pageWeekQuestions(weekId) {
     </div>`;
 }
 
-function saveCustomQ(e, weekId) {
+async function saveCustomQ(e, weekId) {
   e.preventDefault();
   const user = DB.getUser();
   const book = DB.getActiveBook();
@@ -1289,11 +1459,11 @@ function saveCustomQ(e, weekId) {
   if (user === 'jack') q.jackWroteForJordan = text;
   else                 q.jordanWroteForJack = text;
 
-  DB.saveQuestion(q);
+  await DB.saveQuestion(q);
   navigate(`/questions/week/${weekId}`);
 }
 
-function submitAnswers(e, weekId) {
+async function submitAnswers(e, weekId) {
   e.preventDefault();
   const user = DB.getUser();
   const book = DB.getActiveBook();
@@ -1307,8 +1477,15 @@ function submitAnswers(e, weekId) {
     submittedAt: new Date().toISOString(),
   };
 
-  DB.saveQuestion(q);
-  navigate(`/questions/week/${weekId}`);
+  const btn = e.target.querySelector('button[type=submit]');
+  btn.disabled = true;
+  try {
+    await DB.saveQuestion(q);
+    navigate(`/questions/week/${weekId}`);
+  } catch (err) {
+    alert('Failed to save answers. Please try again.');
+    btn.disabled = false;
+  }
 }
 
 // ============================================================
@@ -1316,7 +1493,6 @@ function submitAnswers(e, weekId) {
 // ============================================================
 function pageNotes() {
   const user  = DB.getUser();
-  const them  = other(user);
   const notes = DB.getNotes();
 
   return `
@@ -1336,8 +1512,7 @@ function pageNotes() {
           <div class="note-form-footer">
             <div class="note-page-field">
               <label class="form-label" style="margin-bottom:4px">Page</label>
-              <input type="number" name="page" class="form-input note-page-input"
-                placeholder="—" min="1">
+              <input type="number" name="page" class="form-input note-page-input" placeholder="—" min="1">
             </div>
             <button type="submit" class="btn btn-primary">Add Note</button>
           </div>
@@ -1370,15 +1545,17 @@ function pageNotes() {
     </div>`;
 }
 
-function addNote(e) {
+async function addNote(e) {
   e.preventDefault();
+  const book = DB.getActiveBook();
   const user = DB.getUser();
   const d    = Object.fromEntries(new FormData(e.target));
   const text = d.text.trim();
   if (!text) return;
 
-  DB.saveNote({
+  await DB.saveNote({
     id:        crypto.randomUUID(),
+    bookId:    book?.id || null,
     author:    user,
     text,
     page:      d.page ? parseInt(d.page) : null,
@@ -1388,8 +1565,8 @@ function addNote(e) {
   navigate('/notes');
 }
 
-function deleteNote(id) {
-  DB.deleteNote(id);
+async function deleteNote(id) {
+  await DB.deleteNote(id);
   navigate('/notes');
 }
 
@@ -1410,21 +1587,16 @@ function noBookPage(title) {
 // ============================================================
 // INIT
 // ============================================================
-function seedDefaultData() {
-  if (DB.getBooks().length > 0) return;
-  DB.saveBook({
-    id: 'lean-startup',
-    title: 'The Lean Startup',
-    author: 'Eric Ries',
-    totalPages: 336,
-    color: '#2D5A27',
-    isActive: true,
-    createdAt: new Date().toISOString(),
-  });
+async function initApp() {
+  const { data: { session } } = await sb.auth.getSession();
+  if (!session) { renderFull(pageLogin('login')); return; }
+
+  const { data: account } = await sb.from('accounts').select('*').eq('id', session.user.id).single();
+  if (!account) { renderFull(pageCompleteProfile()); return; }
+
+  State.account = account;
+  await loadData();
+  handleRoute();
 }
 
-document.addEventListener('DOMContentLoaded', async () => {
-  seedDefaultData();
-  await Sync.pull(); // fetch remote state before first render so we show latest data
-  handleRoute();
-});
+document.addEventListener('DOMContentLoaded', initApp);

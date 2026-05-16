@@ -546,6 +546,61 @@ img { display: block; }
   color: var(--charcoal);
 }
 
+/* Auth form */
+.auth-form {
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+  margin-top: 8px;
+}
+
+.auth-form .form-group {
+  margin-bottom: 12px;
+}
+
+.auth-btn {
+  width: 100%;
+  justify-content: center;
+  margin-top: 4px;
+}
+
+.auth-error {
+  color: #b83232;
+  font-size: 13px;
+  min-height: 18px;
+  margin-bottom: 6px;
+  text-align: center;
+}
+
+.auth-switch {
+  text-align: center;
+  font-size: 13px;
+  color: var(--text-3);
+  margin-top: 12px;
+}
+
+.auth-switch a {
+  color: var(--pine);
+  text-decoration: none;
+  font-weight: 500;
+}
+
+/* Radio-wrapped user cards — hide native radio, highlight selected card */
+.user-card-radio {
+  display: block;
+  cursor: pointer;
+}
+
+.user-card-radio input[type="radio"] {
+  display: none;
+}
+
+.user-card-radio input[type="radio"]:checked + .user-card {
+  border-color: var(--pine);
+  box-shadow: 0 0 0 3px var(--pine-pale), var(--shadow);
+}
+
 /* ============================================================
    EMPTY STATE
    ============================================================ */
