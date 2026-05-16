@@ -356,7 +356,7 @@ function pageLogin(mode = 'login') {
       <div class="user-select-inner">
         <div class="user-select-logo">${icons.mountain}</div>
         <h1>BookClub</h1>
-        <p class="user-select-subtitle">Jack &amp; Jordan · Breckenridge, CO</p>
+        <p class="user-select-subtitle">Jack &amp; Jordan · Knowledge</p>
 
         ${isSignup ? `
           <form class="auth-form" onsubmit="handleSignup(event)">
