@@ -140,6 +140,8 @@ const DB = {
   updateProgress: async (username, page) => {
     const book = DB.getActiveBook();
     if (!book) return;
+    const current = State.progress[username]?.currentPage ?? 0;
+    if (page <= current) return; // forward-only
     const { error: uErr } = await sb.from('progress').upsert({
       account_id: State.account.id, book_id: book.id,
       current_page: page,
