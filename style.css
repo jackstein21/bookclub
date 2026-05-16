@@ -1389,6 +1389,25 @@ img { display: block; }
   .note-form-footer { flex-direction: column; align-items: stretch; }
   .note-page-field  { flex-direction: row; align-items: center; gap: 10px; }
   .note-page-field .form-label { margin-bottom: 0; width: 36px; flex-shrink: 0; }
+
+  /* Books list — stack info + actions vertically */
+  .book-list-card {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 12px;
+  }
+  .book-list-actions {
+    width: 100%;
+    flex-wrap: wrap;
+    gap: 8px;
+  }
+  .book-list-actions .btn { flex: 1; justify-content: center; min-width: 72px; }
+
+  /* Book detail */
+  .book-detail-top { flex-direction: column; }
+  .book-detail-cover { width: 100px; }
+  .lib-dates-row { flex-direction: column; gap: 14px; }
+  .lib-date-input { max-width: 100%; }
 }
 
 /* ============================================================
