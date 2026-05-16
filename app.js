@@ -21,6 +21,7 @@ const State = {
   progress:  {},    // { jack: { currentPage, updatedAt, history: [] }, jordan: {...} }
   questions: [],
   notes:     [],    // each note: { id, bookId, author (username), accountId, text, page, createdAt }
+  library:   {},    // { [bookId]: { jack: { id, startedAt, finishedAt }, jordan: {...} } }
 };
 
 // ============================================================
@@ -29,7 +30,7 @@ const State = {
 async function loadData() {
   if (!State.account) return;
 
-  const [booksRes, deadlinesRes, progressRes, historyRes, questionsRes, notesRes, accountsRes] =
+  const [booksRes, deadlinesRes, progressRes, historyRes, questionsRes, notesRes, accountsRes, libraryRes] =
     await Promise.all([
       sb.from('books').select('*').eq('club_id', State.account.club_id).order('created_at'),
       sb.from('deadlines').select('*').order('date'),
@@ -38,6 +39,7 @@ async function loadData() {
       sb.from('questions').select('*'),
       sb.from('notes').select('*').order('created_at', { ascending: false }),
       sb.from('accounts').select('id, username').eq('club_id', State.account.club_id),
+      sb.from('library').select('*'),
     ]);
 
   const accountMap = {};
@@ -47,7 +49,23 @@ async function loadData() {
     id: b.id, title: b.title, author: b.author,
     totalPages: b.total_pages, color: b.color || '#2D5A27',
     isActive: b.is_active, createdAt: b.created_at,
+    coverUrl: b.cover_url || null,
+    description: b.description || null,
+    isbn: b.isbn || null,
+    publishedYear: b.published_year || null,
   }));
+
+  State.library = {};
+  (libraryRes.data || []).forEach(row => {
+    const username = accountMap[row.account_id];
+    if (!username) return;
+    if (!State.library[row.book_id]) State.library[row.book_id] = {};
+    State.library[row.book_id][username] = {
+      id: row.id,
+      startedAt: row.started_at,
+      finishedAt: row.finished_at,
+    };
+  });
 
   State.deadlines = (deadlinesRes.data || []).map(d => ({
     id: d.id, bookId: d.book_id, type: d.type, label: d.label,
@@ -94,11 +112,38 @@ const DB = {
       id: b.id, club_id: State.account.club_id,
       title: b.title, author: b.author, total_pages: b.totalPages,
       color: b.color, is_active: b.isActive,
+      cover_url: b.coverUrl || null,
+      description: b.description || null,
+      isbn: b.isbn || null,
+      published_year: b.publishedYear || null,
     });
     if (error) throw error;
     const i = State.books.findIndex(x => x.id === b.id);
     i >= 0 ? State.books[i] = b : State.books.push(b);
     if (b.isActive) State.books.forEach(x => { if (x.id !== b.id) x.isActive = false; });
+  },
+
+  getLibraryEntry: (bookId, username) => State.library[bookId]?.[username] || null,
+
+  saveLibraryEntry: async (bookId, username, { startedAt, finishedAt }) => {
+    const existing = State.library[bookId]?.[username];
+    const payload = {
+      book_id: bookId,
+      account_id: State.account.id,
+      started_at: startedAt || null,
+      finished_at: finishedAt || null,
+    };
+    let error, rowId;
+    if (existing?.id) {
+      rowId = existing.id;
+      ({ error } = await sb.from('library').update(payload).eq('id', rowId));
+    } else {
+      rowId = crypto.randomUUID();
+      ({ error } = await sb.from('library').insert({ id: rowId, ...payload }));
+    }
+    if (error) throw error;
+    if (!State.library[bookId]) State.library[bookId] = {};
+    State.library[bookId][username] = { id: rowId, startedAt, finishedAt };
   },
 
   setActiveBook: async (id) => {
@@ -264,6 +309,7 @@ async function handleRoute() {
   else if (hash === '/books')                     content = pageBooks();
   else if (hash === '/books/add')                 content = pageBookForm(null);
   else if (hash.startsWith('/books/edit/'))       content = pageBookForm(DB.getBooks().find(b => b.id === parts[2]));
+  else if (hash.startsWith('/books/') && parts.length === 2) content = pageBookDetail(DB.getBooks().find(b => b.id === parts[1]));
   else if (hash === '/deadlines')                 content = pageDeadlines();
   else if (hash === '/deadlines/add')             content = pageAddDeadline(null);
   else if (hash.startsWith('/deadlines/edit/'))   content = pageAddDeadline(DB.getDeadlines().find(d => d.id === parts[2]));
@@ -779,17 +825,20 @@ function pageBooks() {
           ${books.map(b => `
             <div class="card book-list-card ${b.isActive ? 'book-active' : ''}">
               <div class="book-list-info">
-                <div class="book-list-spine" style="background:${b.color || '#2D5A27'}"></div>
+                ${b.coverUrl
+                  ? `<img src="${b.coverUrl.replace('-L.jpg','-M.jpg')}" class="book-list-cover" alt="">`
+                  : `<div class="book-list-spine" style="background:${b.color || '#2D5A27'}"></div>`}
                 <div>
                   <div class="book-list-title">${b.title}</div>
                   <div class="book-list-author">${b.author}</div>
-                  <div class="book-list-pages">${b.totalPages} pages</div>
+                  <div class="book-list-pages">${b.totalPages} pages${b.publishedYear ? ` · ${b.publishedYear}` : ''}</div>
                 </div>
               </div>
               <div class="book-list-actions">
                 ${b.isActive
                   ? `<span class="badge badge-pine">Active</span>`
                   : `<button class="btn btn-ghost btn-sm" onclick="setActiveBook('${b.id}')">Set Active</button>`}
+                <a href="#/books/${b.id}" class="btn btn-ghost btn-sm">Details</a>
                 <a href="#/books/edit/${b.id}" class="btn btn-ghost btn-sm">Edit</a>
                 <button class="btn btn-ghost btn-sm btn-danger" onclick="confirmDeleteBook('${b.id}')">Delete</button>
               </div>
@@ -811,6 +860,106 @@ async function confirmDeleteBook(id) {
 }
 
 // ============================================================
+// PAGE: BOOK DETAIL
+// ============================================================
+function pageBookDetail(book) {
+  if (!book) return `<div class="page"><div class="empty-state"><p>Book not found.</p><a href="#/books" class="btn btn-ghost">← Back</a></div></div>`;
+
+  const user    = DB.getUser();
+  const them    = other(user);
+  const myLib   = DB.getLibraryEntry(book.id, user);
+  const theirLib= DB.getLibraryEntry(book.id, them);
+
+  function dateInput(name, val, label) {
+    return `
+      <div class="lib-date-field">
+        <label class="form-label">${label}</label>
+        <input type="date" name="${name}" class="form-input lib-date-input" value="${val || ''}">
+      </div>`;
+  }
+
+  return `
+    <div class="page">
+      <div class="page-header">
+        <div>
+          <h1 class="page-title">${book.title}</h1>
+          <p class="page-subtitle">${book.author}${book.publishedYear ? ` · ${book.publishedYear}` : ''}</p>
+        </div>
+        <a href="#/books" class="btn btn-ghost">← Back</a>
+      </div>
+
+      <div class="book-detail-layout">
+
+        <div class="book-detail-top">
+          ${book.coverUrl ? `<img src="${book.coverUrl}" class="book-detail-cover" alt="${book.title} cover">` : ''}
+          <div class="book-detail-meta">
+            <div class="book-meta-row"><span class="meta-label">Author</span><span>${book.author}</span></div>
+            <div class="book-meta-row"><span class="meta-label">Pages</span><span>${book.totalPages}</span></div>
+            ${book.publishedYear ? `<div class="book-meta-row"><span class="meta-label">Published</span><span>${book.publishedYear}</span></div>` : ''}
+            ${book.isbn ? `<div class="book-meta-row"><span class="meta-label">ISBN</span><span class="muted">${book.isbn}</span></div>` : ''}
+            <div class="book-meta-actions">
+              <a href="#/books/edit/${book.id}" class="btn btn-secondary btn-sm">Edit Book</a>
+            </div>
+          </div>
+        </div>
+
+        ${book.description ? `
+          <div class="card">
+            <div class="card-label">About</div>
+            <p class="book-description">${book.description}</p>
+          </div>
+        ` : ''}
+
+        <div class="card">
+          <div class="card-label">Your Reading Dates</div>
+          <form onsubmit="saveLibraryDates(event,'${book.id}')">
+            <div class="lib-dates-row">
+              ${dateInput('startedAt', myLib?.startedAt, 'Started')}
+              ${dateInput('finishedAt', myLib?.finishedAt, 'Finished')}
+            </div>
+            <div class="form-actions">
+              <button type="submit" class="btn btn-primary btn-sm">Save Dates</button>
+            </div>
+          </form>
+        </div>
+
+        <div class="card">
+          <div class="card-label">${cap(them)}'s Reading Dates</div>
+          <div class="lib-dates-row">
+            <div class="lib-date-field">
+              <span class="meta-label">Started</span>
+              <span>${theirLib?.startedAt ? fmtDate(theirLib.startedAt) : '—'}</span>
+            </div>
+            <div class="lib-date-field">
+              <span class="meta-label">Finished</span>
+              <span>${theirLib?.finishedAt ? fmtDate(theirLib.finishedAt) : '—'}</span>
+            </div>
+          </div>
+        </div>
+
+      </div>
+    </div>`;
+}
+
+async function saveLibraryDates(e, bookId) {
+  e.preventDefault();
+  const d   = Object.fromEntries(new FormData(e.target));
+  const btn = e.target.querySelector('button[type=submit]');
+  btn.disabled = true; btn.textContent = 'Saving…';
+  try {
+    await DB.saveLibraryEntry(bookId, DB.getUser(), {
+      startedAt:  d.startedAt  || null,
+      finishedAt: d.finishedAt || null,
+    });
+    btn.textContent = 'Saved ✓';
+    setTimeout(() => { btn.disabled = false; btn.textContent = 'Save Dates'; }, 1500);
+  } catch (err) {
+    alert('Failed to save dates. Please try again.');
+    btn.disabled = false; btn.textContent = 'Save Dates';
+  }
+}
+
+// ============================================================
 // PAGE: ADD / EDIT BOOK
 // ============================================================
 const SPINE_COLORS = ['#2D5A27','#4E7FA0','#8B6914','#7B5EA7','#B83232','#2C7873','#A06030'];
@@ -824,7 +973,26 @@ function pageBookForm(book) {
         <a href="#/books" class="btn btn-ghost">← Back</a>
       </div>
       <div class="card form-card">
+        ${!isEdit ? `
+          <div class="form-group ol-search-group">
+            <label class="form-label">Search Open Library <span class="form-optional">(autofill)</span></label>
+            <div class="ol-search-row">
+              <input id="ol-search-input" type="text" class="form-input" placeholder="Title to search…"
+                onkeydown="if(event.key==='Enter'){event.preventDefault();searchOpenLibrary();}">
+              <button id="ol-search-btn" type="button" class="btn btn-secondary" onclick="searchOpenLibrary()">Search</button>
+            </div>
+            <div id="ol-results" class="ol-results"></div>
+          </div>
+          <hr class="form-divider">
+        ` : ''}
         <form onsubmit="saveBook(event,'${book?.id || ''}')">
+          <input type="hidden" name="coverUrl" value="${book?.coverUrl || ''}">
+          <input type="hidden" name="isbn" value="${book?.isbn || ''}">
+          <input type="hidden" name="publishedYear" value="${book?.publishedYear || ''}">
+          <input type="hidden" name="description" value="${book?.description || ''}">
+          <div id="ol-cover-preview">
+            ${book?.coverUrl ? `<img src="${book.coverUrl.replace('-L.jpg','-M.jpg')}" class="book-cover-preview">` : ''}
+          </div>
           <div class="form-group">
             <label class="form-label">Title *</label>
             <input name="title" type="text" class="form-input" required value="${book?.title || ''}" placeholder="e.g. The Goldfinch">
@@ -856,6 +1024,50 @@ function pageBookForm(book) {
     </div>`;
 }
 
+async function searchOpenLibrary() {
+  const input = document.getElementById('ol-search-input');
+  const title = input?.value.trim();
+  if (!title) return;
+  const btn = document.getElementById('ol-search-btn');
+  btn.textContent = 'Searching…'; btn.disabled = true;
+  try {
+    const res  = await fetch(`https://openlibrary.org/search.json?title=${encodeURIComponent(title)}&fields=key,title,author_name,number_of_pages_median,cover_i,first_publish_year,isbn&limit=5`);
+    const data = await res.json();
+    window._olDocs = data.docs || [];
+    const container = document.getElementById('ol-results');
+    if (!window._olDocs.length) { container.innerHTML = '<p class="muted-sm" style="margin-top:8px">No results found.</p>'; return; }
+    container.innerHTML = window._olDocs.map((d, i) => `
+      <button type="button" class="ol-result-item" onclick="selectOLResult(${i})">
+        ${d.cover_i ? `<img src="https://covers.openlibrary.org/b/id/${d.cover_i}-S.jpg" class="ol-cover-thumb" alt="">` : '<div class="ol-no-cover"></div>'}
+        <div class="ol-result-info">
+          <div class="ol-result-title">${d.title}</div>
+          <div class="ol-result-author">${(d.author_name || []).slice(0,2).join(', ')}</div>
+          <div class="ol-result-meta">${[d.first_publish_year, d.number_of_pages_median ? d.number_of_pages_median + ' pages' : ''].filter(Boolean).join(' · ')}</div>
+        </div>
+      </button>`).join('');
+  } catch {
+    document.getElementById('ol-results').innerHTML = '<p class="muted-sm" style="margin-top:8px">Search failed — fill in manually.</p>';
+  } finally {
+    btn.textContent = 'Search'; btn.disabled = false;
+  }
+}
+
+function selectOLResult(i) {
+  const d = window._olDocs[i];
+  const form = document.querySelector('form[onsubmit^="saveBook"]');
+  form.querySelector('[name=title]').value      = d.title || '';
+  form.querySelector('[name=author]').value     = (d.author_name || []).slice(0,2).join(', ');
+  if (d.number_of_pages_median) form.querySelector('[name=totalPages]').value = d.number_of_pages_median;
+  const coverUrl = d.cover_i ? `https://covers.openlibrary.org/b/id/${d.cover_i}-L.jpg` : '';
+  form.querySelector('[name=coverUrl]').value      = coverUrl;
+  form.querySelector('[name=publishedYear]').value = d.first_publish_year || '';
+  form.querySelector('[name=isbn]').value          = (d.isbn || [])[0] || '';
+  document.getElementById('ol-results').innerHTML  = '';
+  document.getElementById('ol-cover-preview').innerHTML = coverUrl
+    ? `<img src="${coverUrl.replace('-L.jpg','-M.jpg')}" class="book-cover-preview">`
+    : '';
+}
+
 async function saveBook(e, existingId) {
   e.preventDefault();
   const d       = Object.fromEntries(new FormData(e.target));
@@ -868,13 +1080,17 @@ async function saveBook(e, existingId) {
 
   try {
     await DB.saveBook({
-      id:         existingId || crypto.randomUUID(),
-      title:      d.title.trim(),
-      author:     d.author.trim(),
-      totalPages: parseInt(d.totalPages),
-      color:      d.color || SPINE_COLORS[0],
-      isActive:   existing ? existing.isActive : isFirst,
-      createdAt:  existing?.createdAt || new Date().toISOString(),
+      id:           existingId || crypto.randomUUID(),
+      title:        d.title.trim(),
+      author:       d.author.trim(),
+      totalPages:   parseInt(d.totalPages),
+      color:        d.color || SPINE_COLORS[0],
+      isActive:     existing ? existing.isActive : isFirst,
+      createdAt:    existing?.createdAt || new Date().toISOString(),
+      coverUrl:     d.coverUrl || existing?.coverUrl || null,
+      isbn:         d.isbn || existing?.isbn || null,
+      publishedYear:d.publishedYear ? parseInt(d.publishedYear) : (existing?.publishedYear || null),
+      description:  d.description || existing?.description || null,
     });
     navigate('/books');
   } catch (err) {
