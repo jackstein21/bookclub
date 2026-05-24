@@ -581,7 +581,11 @@ function pageDashboard() {
     </div>`;
 
   const deadlines    = DB.getDeadlines().filter(d => d.bookId === book.id);
-  const nextDeadline = deadlines.find(d => !isPast(d.date));
+  const nextDeadline = deadlines.find(d => {
+    const q = DB.getQuestion(d.id);
+    const bothAnswered = !!(q?.answers?.jack?.submittedAt && q?.answers?.jordan?.submittedAt);
+    return !isPast(d.date) || !bothAnswered;
+  });
   const weeks        = getWeeks(book.id);
 
   const pendingWeeks = weeks.filter(w => {
@@ -1129,8 +1133,12 @@ function pageDeadlines() {
             </div>
           ` : `
             <div class="deadline-list">
-              ${deadlines.map((d, i) => `
-                <div class="card deadline-list-card ${isPast(d.date) ? 'deadline-past' : ''} ${d.isFinal ? 'deadline-final' : ''}">
+              ${deadlines.map((d, i) => {
+                const q = DB.getQuestion(d.id);
+                const bothAnswered = !!(q?.answers?.jack?.submittedAt && q?.answers?.jordan?.submittedAt);
+                const isPastDate = isPast(d.date);
+                return `
+                <div class="card deadline-list-card ${isPastDate && !bothAnswered ? 'deadline-past' : ''} ${bothAnswered ? 'deadline-done' : ''} ${d.isFinal ? 'deadline-final' : ''}">
                   <div class="deadline-list-week">
                     Week ${i+1}
                     ${d.isFinal ? '<span class="final-badge">Final</span>' : ''}
@@ -1144,13 +1152,16 @@ function pageDeadlines() {
                   </div>
                   <div class="deadline-list-right">
                     <div class="deadline-list-date">${fmtDate(d.date)}</div>
-                    ${daysChip(daysUntil(d.date))}
+                    ${bothAnswered
+                      ? `<span class="chip chip-green">✓ Complete</span>`
+                      : daysChip(daysUntil(d.date))}
                     <div class="deadline-actions">
                       <a href="#/deadlines/edit/${d.id}" class="btn btn-ghost btn-sm">Edit</a>
                       <button class="btn btn-ghost btn-sm btn-danger" onclick="confirmDeleteDeadline('${d.id}')">Delete</button>
                     </div>
                   </div>
-                </div>`).join('')}
+                </div>`;
+              }).join('')}
             </div>`}
         </div>
       </div>
@@ -1544,10 +1555,10 @@ function pageWeekQuestions(weekId) {
           <p class="question-text">"${questionForMe}"</p>
           ${upcoming ? `<p class="muted-sm">Think about this while reading — you'll answer it when the deadline arrives.</p>` : ''}
         </div>
-      ` : !bothWrote && upcoming ? `
+      ` : !bothWrote ? `
         <div class="card" style="background:var(--cream);border-color:var(--border);margin-bottom:16px;padding:14px 18px">
           ${(user === 'jack' ? jordanQ : jackQ) ? `
-            <p class="muted-sm">⏳ ${cap(them)} wrote a question for you — it'll appear once you've both submitted yours.</p>
+            <p class="muted-sm">⏳ ${cap(them)} wrote a question for you — it'll be revealed once you've both submitted yours.</p>
           ` : `
             <p class="muted-sm">${cap(them)} hasn't written your question for this week yet.</p>
           `}
@@ -1631,6 +1642,15 @@ function pageWeekQuestions(weekId) {
             <p class="muted">Waiting for ${cap(them)} to submit their answers…</p>
           </div>`}
 
+      ` : !bothWrote ? `
+        <div class="card" style="background:var(--cream);border-color:var(--border);padding:16px 18px;margin-bottom:16px">
+          <p style="font-weight:600;margin-bottom:6px">⏳ Questions not ready yet</p>
+          <p class="muted-sm">Both of you need to write your custom questions before anyone can answer. ${
+            !questionIWrote
+              ? `Write yours above to get started.`
+              : `Waiting for ${cap(them)} to write their question.`
+          }</p>
+        </div>
       ` : `
         ${theirSubmitted ? `
           <div class="card" style="background:var(--pine-pale);border-color:var(--pine);padding:12px 18px;margin-bottom:16px">
@@ -1709,7 +1729,7 @@ async function submitAnswers(e, weekId) {
 // ============================================================
 // PAGE: NOTES
 // ============================================================
-function pageNotes() {
+function pageNotes(flash) {
   const user  = DB.getUser();
   const notes = DB.getNotes();
 
@@ -1722,23 +1742,10 @@ function pageNotes() {
         </div>
       </div>
 
-      <div class="card note-add-card">
-        <div class="card-label">✍️ Add a note</div>
-        <form onsubmit="addNote(event)" class="note-form">
-          <textarea name="text" class="form-input form-textarea" required
-            placeholder="What caught your attention?"></textarea>
-          <div class="note-form-footer">
-            <div class="note-page-field">
-              <label class="form-label" style="margin-bottom:4px">Page</label>
-              <input type="number" name="page" class="form-input note-page-input" placeholder="—" min="1">
-            </div>
-            <button type="submit" class="btn btn-primary">Add Note</button>
-          </div>
-        </form>
-      </div>
+      ${flash ? `<div class="note-flash" id="note-flash">✓ Note saved</div>` : ''}
 
       ${notes.length === 0 ? `
-        <div class="empty-state" style="margin-top:24px">
+        <div class="empty-state" style="margin-top:0;margin-bottom:24px">
           <div class="empty-icon">📝</div>
           <h3>No notes yet</h3>
           <p>Capture a thought while it's fresh — page numbers optional but useful for discussion.</p>
@@ -1760,6 +1767,22 @@ function pageNotes() {
           `).join('')}
         </div>
       `}
+
+      <div class="card note-add-card">
+        <div class="card-label">✍️ Add a note</div>
+        <form onsubmit="addNote(event)" class="note-form">
+          <textarea name="text" class="form-input form-textarea" required
+            placeholder="What caught your attention?"></textarea>
+          <div class="note-form-footer">
+            <div class="note-page-field">
+              <label class="form-label" style="margin-bottom:4px">Page</label>
+              <input type="number" name="page" class="form-input note-page-input" placeholder="—" min="1">
+            </div>
+            <button type="submit" class="btn btn-primary">Add Note</button>
+          </div>
+        </form>
+      </div>
+
     </div>`;
 }
 
@@ -1771,16 +1794,32 @@ async function addNote(e) {
   const text = d.text.trim();
   if (!text) return;
 
-  await DB.saveNote({
-    id:        crypto.randomUUID(),
-    bookId:    book?.id || null,
-    author:    user,
-    text,
-    page:      d.page ? parseInt(d.page) : null,
-    createdAt: new Date().toISOString(),
-  });
-  e.target.reset();
-  navigate('/notes');
+  const btn = e.target.querySelector('button[type=submit]');
+  btn.disabled = true;
+  try {
+    await DB.saveNote({
+      id:        crypto.randomUUID(),
+      bookId:    book?.id || null,
+      author:    user,
+      text,
+      page:      d.page ? parseInt(d.page) : null,
+      createdAt: new Date().toISOString(),
+    });
+    e.target.reset();
+    // Re-render with flash, then scroll to top so the new note is visible
+    await loadData();
+    renderWithShell(pageNotes(true));
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+    // Fade out flash after 2.5s
+    setTimeout(() => {
+      const f = document.getElementById('note-flash');
+      if (f) f.style.opacity = '0';
+    }, 2500);
+  } catch (err) {
+    alert('Failed to save note. Please try again.');
+  } finally {
+    btn.disabled = false;
+  }
 }
 
 async function deleteNote(id) {
